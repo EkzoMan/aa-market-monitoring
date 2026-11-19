@@ -37,6 +37,7 @@ ESI_OPERATIONS = [
     "GetUniverseStructuresStructureId",
 ]
 
+# Собственный провайдер django-esi: `esi.client.Market.GetMarketsRegionIdOrders` и т.д.
 esi = ESIClientProvider(
     ua_appname="aa-market-monitoring",
     ua_version="1.0.0",
@@ -53,13 +54,37 @@ class RateLimitStop(Exception):
         self.reset_seconds = reset_seconds
 
 
+def _get_header(headers: Any, name: str) -> str | None:
+    """Чтение заголовка независимо от типа объекта headers (dict, aiopenapi3-обёртка и т.п.)."""
+    if headers is None:
+        return None
+    # 1) словарь-подобный интерфейс
+    getter = getattr(headers, "get", None)
+    if callable(getter):
+        try:
+            value = getter(name)
+            if value is not None:
+                return value
+        except Exception:
+            pass
+    # 2) доступ по индексу
+    try:
+        return headers[name]
+    except (KeyError, IndexError, TypeError):
+        pass
+    # 3) доступ как к атрибуту (в т.ч. case-insensitive для common-имён)
+    attr = name.replace("-", "_").lower()
+    value = getattr(headers, attr, None)
+    if value is not None:
+        return value
+    return getattr(headers, name, None)
+
+
 def _get_error_limit_remain(response: Any) -> int | None:
     """Извлечение X-ESI-Error-Limit-Remain из заголовков ответа (если есть)."""
     headers = getattr(response, "headers", None)
-    if not headers:
-        return None
+    raw = _get_header(headers, "X-ESI-Error-Limit-Remain")
     try:
-        raw = headers.get("X-ESI-Error-Limit-Remain") or headers.get("x-esi-error-limit-remain")
         return int(raw) if raw is not None else None
     except (TypeError, ValueError):
         return None
@@ -112,13 +137,15 @@ def _call_with_retry(op_result_fn):
 
 
 def _page_results(op, **params) -> Iterator[tuple[list[dict], Any]]:
-    """Обход страниц операции постранично до пустой страницы; проверяет лимит ошибок.
+    """Обход страниц операции постранично; конец — по заголовку X-Pages или пустой странице.
 
+    Примечание: параметр page_size в текущей версии ESI не поддерживается
+    (эндпоинты всегда отдают до 1000 записей на страницу).
     Возвращает пары (строка-данных, response) — заказчик проверяет заголовки лимита.
     """
     page = 1
+    total_pages: int | None = None
     while True:
-        params.setdefault("page_size", 1000)  # §9.1: page_size=1000
         params["page"] = page
 
         def _fetch(p=params.copy()):
@@ -129,7 +156,16 @@ def _page_results(op, **params) -> Iterator[tuple[list[dict], Any]]:
         _check_error_limit(response)
         orders = data if isinstance(data, list) else ([] if data is None else [data])
         yield orders, response
-        if not orders:
+        # Конец пагинации: по X-Pages (ESI 404 "Requested page does not exist!"
+        # вместо пустой страницы, если запросить страницу за границей).
+        headers = getattr(response, "headers", None)
+        raw_pages = _get_header(headers, "X-Pages")
+        if raw_pages is not None:
+            try:
+                total_pages = int(raw_pages)
+            except (TypeError, ValueError):
+                pass
+        if not orders or (total_pages and page >= total_pages):
             return
         page += 1
 
@@ -137,37 +173,23 @@ def _page_results(op, **params) -> Iterator[tuple[list[dict], Any]]:
 def fetch_jita_orders(type_ids: list[int]) -> tuple[list[dict], bool]:
     """Снимок стакана Jita (§9.1, §9.2): sell-заказы региона Jita по типам расчёта.
 
-    Параметр type_id повторяемый; батч из `jita_type_batch`; page_size=1000; страницы до пустой.
-    При 400 из-за размера батча — уменьшение батча вдвое и повтор.
+    В текущей версии ESI type_id — одиночный параметр, поэтому запрос идёт
+    по одному типу за вызов (page_size не поддерживается; конец пагинации — X-Pages).
     Возвращает (заказы, partial): partial=True при нехватке лимита ошибок ESI.
     """
     settings_obj = PluginSetting.load()
     region_id = settings_obj.jita_region_id
-    batch_size = max(1, settings_obj.jita_type_batch)
     orders: list[dict] = []
     partial = False
-    type_ids = list(type_ids)
-    pos = 0
-    while pos < len(type_ids):
-        batch = type_ids[pos : pos + batch_size]
-        op = esi.client.Market.GetMarketsRegionIdOrders
+    op = esi.client.Market.GetMarketsRegionIdOrders
+    for type_id in type_ids:
         try:
-            for batch_orders, _resp in _page_results(op, region_id=region_id, order_type="sell", type_id=batch):
+            for batch_orders, _resp in _page_results(op, region_id=region_id, order_type="sell", type_id=type_id):
                 orders.extend(batch_orders)
-            pos += len(batch)
         except RateLimitStop:
             # Нехватка лимита ошибок: помечаем partial и останавливаем обход (§9.2).
             partial = True
             break
-        except HTTPClientError as exc:
-            status = getattr(exc, "status_code", None)
-            if status == 400 and len(batch) > 1:
-                # 400 из-за размера батча: уменьшаем вдвое и повторяем тот же срез (§9.2).
-                new_size = max(1, len(batch) // 2)
-                logger.info("Batch of %s rejected (400), retrying with %s", len(batch), new_size)
-                batch_size = new_size
-                continue
-            raise
     return orders, partial
 
 
@@ -234,8 +256,15 @@ def fetch_structure_info(structure_id: int, character_id: int) -> dict:
     return _call_with_retry(_fetch)
 
 
+def _order_field(order: Any, name: str, default: Any = None) -> Any:
+    """Чтение поля ордера ESI: django-esi 9.9 отдаёт pydantic-модели (атрибуты), старые версии — dict."""
+    if isinstance(order, dict):
+        return order.get(name, default)
+    return getattr(order, name, default)
+
+
 def build_order_cache_rows(
-    orders: Iterable[dict],
+    orders: Iterable[Any],
     *,
     source_kind: str,
     source_ref: int,
@@ -248,18 +277,21 @@ def build_order_cache_rows(
     now = timezone.now()
     rows: list[dict] = []
     for order in orders:
-        if order.get("is_buy_order", False):
+        if _order_field(order, "is_buy_order", False):
             continue
+        volume = _order_field(order, "volume_remain", None)
+        if volume is None:
+            volume = _order_field(order, "volume_total", 0)
         rows.append(
             {
                 "source_kind": source_kind,
                 "source_ref": source_ref,
-                "location_id": order.get("location_id"),
-                "solar_system_id": order.get("system_id"),
-                "region_id": order.get("region_id") or source_ref,
-                "type_id": order.get("type_id"),
-                "price": order.get("price"),
-                "volume": int(order.get("volume_remain", order.get("volume_total", 0))),
+                "location_id": _order_field(order, "location_id"),
+                "solar_system_id": _order_field(order, "system_id"),
+                "region_id": _order_field(order, "region_id") or source_ref,
+                "type_id": _order_field(order, "type_id"),
+                "price": _order_field(order, "price"),
+                "volume": int(volume or 0),
                 "fetched_at": now,
             }
         )

@@ -189,30 +189,35 @@ def _replace_source_cache(source_kind: str, source_ref: int, rows: list[dict]) -
         return len(objs)
 
 
-def _replace_jita_levels(type_ids: list[int], orders: list[dict]) -> int:
+def _replace_jita_levels(type_ids: list[int], orders: list) -> int:
     """Полная замена JitaOrderLevel по затронутым type_id: топ-jita_book_depth лотов (§9.3).
 
+    Элементы orders — dict или pydantic-модель ордера ESI (django-esi 9.9).
     rank=1 — минимальная цена. Возвращает число вставленных лотов.
     """
     depth = PluginSetting.load().jita_book_depth
-    orders_by_type: dict[int, list[dict]] = {}
+
+    def _f(order, name, default=None):
+        return order.get(name, default) if isinstance(order, dict) else getattr(order, name, default)
+
+    orders_by_type: dict[int, list] = {}
     for order in orders:
-        if order.get("is_buy_order", False):
+        if _f(order, "is_buy_order", False):
             continue
-        orders_by_type.setdefault(order["type_id"], []).append(order)
+        orders_by_type.setdefault(_f(order, "type_id"), []).append(order)
     now = timezone.now()
     with transaction.atomic():
         JitaOrderLevel.objects.filter(type_id__in=type_ids).delete()
         levels = []
         for type_id, type_orders in orders_by_type.items():
-            sorted_orders = sorted(type_orders, key=lambda o: o["price"])[:depth]
+            sorted_orders = sorted(type_orders, key=lambda o: _f(o, "price"))[:depth]
             for rank, order in enumerate(sorted_orders, start=1):
                 levels.append(
                     JitaOrderLevel(
                         type_id=type_id,
                         rank=rank,
-                        price=order["price"],
-                        volume=int(order.get("volume_remain", 0)),
+                        price=_f(order, "price"),
+                        volume=int(_f(order, "volume_remain", 0) or 0),
                         fetched_at=now,
                     )
                 )
