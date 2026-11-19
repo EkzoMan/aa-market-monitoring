@@ -27,6 +27,7 @@ class MarketmonitoringConfig(AppConfig):
                 "perm": lambda user: has_view(user),
                 "title": _("Market Monitoring"),
                 "url_name": "marketmonitoring:index",
+                "order": 1200,
             }
 
         @hooks.register("menu_item_hook")
@@ -38,6 +39,7 @@ class MarketmonitoringConfig(AppConfig):
                 "perm": lambda user: has_view(user),
                 "title": _("Components"),
                 "url_name": "marketmonitoring:components",
+                "order": 1210,
             }
 
         @hooks.register("menu_item_hook")
@@ -49,6 +51,7 @@ class MarketmonitoringConfig(AppConfig):
                 "perm": lambda user: has_edit(user),
                 "title": _("Locations"),
                 "url_name": "marketmonitoring:locations",
+                "order": 1220,
             }
 
         @hooks.register("menu_item_hook")
@@ -60,6 +63,7 @@ class MarketmonitoringConfig(AppConfig):
                 "perm": lambda user: has_edit(user),
                 "title": _("Settings"),
                 "url_name": "marketmonitoring:settings",
+                "order": 1230,
             }
 
 

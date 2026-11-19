@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "aa-market-monitoring"
 version = "1.0.0"
@@ -8,6 +12,10 @@ dependencies = [
     "django-eveuniverse>=1.5",
     "requests>=2.31",
 ]
+
+[tool.setuptools.packages.find]
+include = ["marketmonitoring*"]
+exclude = ["testproject*"]
 
 [tool.black]
 line-length = 120
