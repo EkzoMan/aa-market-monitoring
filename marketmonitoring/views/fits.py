@@ -244,6 +244,11 @@ def fit_detail(request, fit_id: int):
         "total_cost": display_total,
         "reasons": data.reasons if no_data else [],
         "rows": rows,
+        # Счётчики шапки (02-fit-detail.md): оверпрайс-позиции и строки с дефицитом.
+        "overprice_count": fit.overprice_count or 0,
+        "deficit_lines": sum(
+            1 for row in rows if not row["no_data"] and row["deficit"] is not None and row["deficit"] > 0
+        ),
         "can_edit": has_edit(request.user),
         "export_txt_url": reverse("marketmonitoring:export_txt", args=[fit.pk]),
         "export_csv_url": reverse("marketmonitoring:export_csv", args=[fit.pk]),

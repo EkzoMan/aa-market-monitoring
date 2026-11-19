@@ -1,18 +1,25 @@
-{% extends "public/base.html" %}
-{% load i18n %}
+{% extends "allianceauth/base-bs5.html" %}
+{% load i18n static mm_tags %}
 {% block title %}{{ page_title }}{% endblock %}
 
 {% block page_title %}{{ page_title }}{% endblock %}
 
 {% block content %}
-<div class="card card-danger">
-  <div class="card-header"><h3 class="card-title">{% translate "Delete location" %}</h3></div>
+<link rel="stylesheet" href="{% static 'marketmonitoring/css/mm.css' %}">
+{# Confirm-экран удаления локации (05-locations.md, 07-states.md §5). #}
+<div class="card border-danger">
+  <div class="card-header bg-danger-subtle">
+    <h3 class="card-title">
+      <i class="fas fa-triangle-exclamation text-danger me-1" aria-hidden="true"></i>
+      {% translate "Delete location" %} “{{ obj.name }}”?
+    </h3>
+  </div>
   <div class="card-body">
-    <p>{% translate "Delete location" %} «{{ obj.name }}»?</p>
+    <p>{% translate "The location will be removed from monitoring. Fits that reference it will lose pricing data." %}</p>
     <form method="post">
       {% csrf_token %}
-      <button type="submit" class="btn btn-danger">{% translate "Delete" %}</button>
-      <a href="{% url 'marketmonitoring:locations' %}" class="btn btn-secondary">{% translate "Cancel" %}</a>
+      <a href="{% url 'marketmonitoring:locations' %}" class="btn btn-outline-secondary">{% translate "Cancel" %}</a>
+      <button type="submit" class="btn btn-danger"><i class="fas fa-trash me-1" aria-hidden="true"></i>{% translate "Delete — cannot be undone" %}</button>
     </form>
   </div>
 </div>

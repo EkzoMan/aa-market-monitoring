@@ -1,58 +1,95 @@
-{% extends "public/base.html" %}
-{% load i18n %}
+{% extends "allianceauth/base-bs5.html" %}
+{% load i18n static mm_tags %}
 {% block title %}{{ page_title }}{% endblock %}
 
 {% block page_title %}{{ page_title }}{% endblock %}
 
 {% block content %}
+<link rel="stylesheet" href="{% static 'marketmonitoring/css/mm.css' %}">
+
+{# Мастер фита (03-fit-wizard.md): шаг 1 — EFT, шаг 2–3 — предпросмотр и параметры; CSRF в каждой форме. #}
+<div class="mb-2">
+  <a href="{% url 'marketmonitoring:index' %}">&larr; {% translate "Back to dashboard" %}</a>
+</div>
+
+{% if parse_errors %}
+{# Ошибки парсинга (03-fit-wizard.md): перечень непонятных строк с номерами над textarea. #}
+<div class="alert alert-danger">
+  <i class="fas fa-triangle-exclamation me-1" aria-hidden="true"></i>
+  <strong>{% translate "Parse errors" %}:</strong>
+  <ul class="mb-0 mt-2">
+  {% for error in parse_errors %}
+      <li>{{ error.line_no }}: {{ error.line }} — {{ error.message }}</li>
+  {% endfor %}
+  </ul>
+</div>
+{% endif %}
+
 <div class="card card-primary">
-    <div class="card-header">
-        <h3 class="card-title">{% translate "Fit" %}</h3>
-    </div>
-    <div class="card-body">
-        {% if parse_errors %}
-        <div class="alert alert-danger">
-            <ul>
-            {% for error in parse_errors %}
-                <li>{{ error.line_no }}: {{ error.line }} — {{ error.message }}</li>
+  <div class="card-header">
+    <h3 class="card-title">{{ page_title }}</h3>
+    {% if parsed %}
+    <span class="text-body-secondary small">{% translate "Steps 2–3: preview &amp; parameters" %}</span>
+    {% else %}
+    <span class="text-body-secondary small">{% translate "Step 1 of 3: paste EFT" %}</span>
+    {% endif %}
+  </div>
+  <div class="card-body">
+    <form method="post">
+      {% csrf_token %}
+      {{ form.non_field_errors }}
+
+      {% if parsed %}
+      {# Шаг 2: предпросмотр разбора (03-fit-wizard.md §2). #}
+      <h5>{% translate "Parsed components" %}</h5>
+      <div class="table-responsive mb-3">
+        <table class="table table-sm table-hover align-middle mm-table">
+          <thead>
+            <tr>
+              <th>{% translate "Component" %}</th>
+              <th class="text-end">{% translate "Qty per fit" %}</th>
+              <th>{% translate "Charge" %}</th>
+              <th>{% translate "Hull" %}</th>
+              <th>{% translate "Raw line" %}</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for item in parsed %}
+            <tr {% if item.is_hull %}class="mm-hull-row"{% endif %}>
+              <td class="mm-nowrap">
+                {% if item.type_id %}{% type_name item.type_id %}{% else %}<code>{{ item.raw_line }}</code>{% endif %}
+                {% if item.is_hull %}<span class="badge text-bg-primary">{% translate "HULL" %}</span>{% endif %}
+              </td>
+              <td class="mm-num">{{ item.qty_per_fit }}</td>
+              <td>{{ item.is_charge|yesno:"yes,no" }}</td>
+              <td>{{ item.is_hull|yesno:"yes,no" }}</td>
+              <td><code>{{ item.raw_line }}</code></td>
+            </tr>
             {% endfor %}
-            </ul>
-        </div>
-        {% endif %}
+          </tbody>
+        </table>
+      </div>
+      <p class="text-body-secondary small">
+        <i class="fas fa-circle-info me-1" aria-hidden="true"></i>
+        {% translate "HULL row: scope of the hull is the fit scope." %}
+      </p>
+      {% endif %}
 
-        <form method="post">
-            {% csrf_token %}
-            {{ form.as_p }}
+      {# Шаг 1/3: параметры + EFT. #}
+      {{ form.as_p }}
+      {% if parsed %}
+      <p class="text-body-secondary small mb-0">
+        <i class="fas fa-circle-info me-1" aria-hidden="true"></i>
+        {% translate "Parser accepts EFT names in any SDE language." %}
+      </p>
+      {% endif %}
 
-            {% if parsed %}
-            <h4>{% translate "Parsed components" %}</h4>
-            <table class="table table-striped">
-                <thead>
-                    <tr>
-                        <th>{% translate "Type ID" %}</th>
-                        <th>{% translate "Qty per fit" %}</th>
-                        <th>{% translate "Charge" %}</th>
-                        <th>{% translate "Hull" %}</th>
-                        <th>{% translate "Raw line" %}</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    {% for item in parsed %}
-                    <tr>
-                        <td>{{ item.type_id }}</td>
-                        <td>{{ item.qty_per_fit }}</td>
-                        <td>{{ item.is_charge|yesno:"yes,no" }}</td>
-                        <td>{{ item.is_hull|yesno:"yes,no" }}</td>
-                        <td><code>{{ item.raw_line }}</code></td>
-                    </tr>
-                    {% endfor %}
-                </tbody>
-            </table>
-            {% endif %}
-
-            <button class="btn btn-default" name="action" value="parse">{% translate "Parse" %}</button>
-            <button class="btn btn-primary" name="action" value="save">{% translate "Save" %}</button>
-        </form>
-    </div>
+      <div class="d-flex flex-wrap gap-2 mt-3">
+        <button class="btn btn-primary" name="action" value="parse">{% translate "Parse" %} &rarr;</button>
+        <button class="btn btn-success" name="action" value="save">{% translate "Save fit" %}</button>
+        <a href="{% url 'marketmonitoring:index' %}" class="btn btn-outline-secondary">{% translate "Cancel" %}</a>
+      </div>
+    </form>
+  </div>
 </div>
 {% endblock %}

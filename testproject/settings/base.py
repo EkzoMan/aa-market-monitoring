@@ -25,8 +25,16 @@ INSTALLED_APPS = [
     "allianceauth.eveonline",
     "allianceauth.authentication",
     "allianceauth.groupmanagement",
+    # Тест-окружение AA5: меню (MenuItemHook) и темы нужны, чтобы базовые
+    # шаблоны AA рендерились без TemplateDoesNotExist/NoneType в theme-тегах.
+    "allianceauth.menu",
     "allianceauth.thirdparty.navhelper",
     "allianceauth.theme",
+    "allianceauth.theme.bootstrap",
+    "allianceauth.theme.darkly",
+    "allianceauth.theme.flatly",
+    "allianceauth.theme.materia",
+    "allianceauth.custom_css",
     "django_celery_beat",
     "bootstrapform",
     "sri",
@@ -123,7 +131,7 @@ ESI_SSO_CALLBACK_URL = "http://localhost:8000/sso/callback"
 
 SITE_URL = "http://localhost"
 SITE_NAME = "Test AA"
-DEFAULT_THEME = "allianceauth.theme.bootstrap"
+DEFAULT_THEME = "allianceauth.theme.bootstrap.auth_hooks.BootstrapThemeHook"
 CSRF_TRUSTED_ORIGINS = ["http://localhost"]
 LOGIN_TOKEN_SCOPES = ["publicData"]
 ESI_SSO_MANAGE_TOKENS = False

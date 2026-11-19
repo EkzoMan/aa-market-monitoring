@@ -1,94 +1,132 @@
-{% extends "public/base.html" %}
-{% load i18n mm_tags %}
+{% extends "allianceauth/base-bs5.html" %}
+{% load i18n static mm_tags %}
 {% block title %}{% translate "Market Monitoring" %}{% endblock %}
 
 {% block page_title %}{% translate "Market Monitoring" %}{% endblock %}
 
 {% block content %}
-<style>
-  .mm-progress { height: 1rem; min-width: 90px; }
-  .mm-badge-ok { background-color: #28a745; color: #fff; }
-  .mm-badge-deficit { background-color: #fd7e14; color: #fff; }
-  .mm-badge-hull { background-color: #dc3545; color: #fff; }
-  .mm-badge-nodata { background-color: #6c757d; color: #fff; }
-</style>
+<link rel="stylesheet" href="{% static 'marketmonitoring/css/mm.css' %}">
 
-<div class="row mb-3">
-  <div class="col-md-4">
-    <div class="card card-primary">
+{# Шапка-строка: заголовок + (edit) «Refresh now» + индикатор поллинга (01-dashboard.md §1). #}
+<div class="d-flex flex-wrap align-items-center mb-3 gap-2">
+  <h1 class="h3 mb-0 me-auto">{% translate "Market Monitoring" %}</h1>
+  <span id="mm-refresh-status" class="text-body-secondary d-none">
+    <span class="spinner-border spinner-border-sm me-1" role="status"></span>{% translate "Updating data…" %}
+  </span>
+  {% if can_edit %}
+  <form method="post" action="{% url 'marketmonitoring:refresh' %}" class="d-inline">
+    {% csrf_token %}
+    <button type="submit" id="mm-refresh-btn" class="btn btn-primary"
+            {% if in_progress %}disabled{% endif %}>
+      <i class="fas fa-refresh me-1" aria-hidden="true"></i>{% translate "Refresh now" %}
+    </button>
+  </form>
+  {% endif %}
+</div>
+
+<div class="row g-3 mb-3">
+  {# Сводная панель (01-dashboard.md §2): агрегат «итого докупить» + перекрёстная сводка на Components. #}
+  <div class="col-12 col-md-4">
+    <div class="card card-primary h-100">
       <div class="card-header"><h3 class="card-title">{% translate "Summary" %}</h3></div>
       <div class="card-body">
-        <p>{% translate "Total to buy" %}: <strong>{{ total_to_buy|isk }} ISK</strong></p>
+        <div class="h3 mm-num mb-1">{{ total_to_buy|isk }} <small class="text-body-secondary">ISK</small></div>
+        <div class="text-body-secondary small mb-2">{% translate "Total to buy" %}</div>
         {% if no_data_count %}
-        <p class="text-muted">{% translate "NO_DATA fits are not included in the sum." %} ({{ no_data_count }})</p>
+        <p class="text-body-secondary small mb-1">
+          {% translate "NO_DATA fits are not included in the sum." %}
+          <a href="?status=no_data">{% blocktranslate count counter=no_data_count %}{{ counter }} fit has no data{% plural %}{{ counter }} fits have no data{% endblocktranslate %}</a>
+        </p>
         {% endif %}
         {% if hull_missing_count %}
-        <p class="text-danger">{% translate "HULL_MISSING fits" %}: {{ hull_missing_count }}</p>
+        <p class="text-danger mb-1">
+          <i class="fas fa-triangle-exclamation me-1" aria-hidden="true"></i>
+          {% blocktranslate count counter=hull_missing_count %}{{ counter }} fit missing hull{% plural %}{{ counter }} fits missing hull{% endblocktranslate %}
+        </p>
         {% endif %}
-        <p class="text-muted">{% translate "Last checked" %}: {{ last_checked_at|date:"Y-m-d H:i" }}</p>
+        <p class="mb-1">
+          {% blocktranslate count counter=deficit_component_count %}{{ counter }} component with deficit{% plural %}{{ counter }} components with deficit{% endblocktranslate %}
+          <a href="{% url 'marketmonitoring:components' %}" class="ms-1" aria-label="{% translate 'Components' %}">&rarr;</a>
+        </p>
+        <p class="text-body-secondary small mb-0">{% translate "Last checked" %}: {{ last_checked_at|date:"Y-m-d H:i" }}</p>
         {% if last_run %}
-        <p class="text-muted">{% translate "Last sync" %}: {{ last_run.task_name }} ({{ last_run.status }})</p>
+        <p class="text-body-secondary small mb-0">{% translate "Last sync" %}: {{ last_run.task_name }} ({{ last_run.status }})</p>
         {% endif %}
       </div>
     </div>
   </div>
-  <div class="col-md-8">
-    <div class="card">
+
+  {# Фильтры (01-dashboard.md §3): один GET-форма, selects, Apply. #}
+  <div class="col-12 col-md-8">
+    <div class="card h-100">
+      <div class="card-header"><h3 class="card-title">{% translate "Filters" %}</h3></div>
       <div class="card-body">
-        {% if can_edit %}
-        <form method="post" action="{% url 'marketmonitoring:refresh' %}" class="mb-3">
-          {% csrf_token %}
-          <button type="submit" id="mm-refresh-btn" class="btn btn-primary"
-                  {% if in_progress %}disabled{% endif %}>
-            {% if in_progress %}{% translate "Update is running..." %}{% else %}{% translate "Refresh now" %}{% endif %}
-          </button>
-          <span id="mm-refresh-status" class="text-muted"></span>
-        </form>
-        {% endif %}
-        <form method="get" class="form-inline">
-          <select name="status" class="form-control mr-2 mb-1">
-            <option value="">{% translate "All statuses" %}</option>
-            {% for st in status_choices %}
-            <option value="{{ st }}" {% if st == status_filter %}selected{% endif %}>{{ st|upper }}</option>
-            {% endfor %}
-          </select>
-          <select name="scope" class="form-control mr-2 mb-1">
-            <option value="">{% translate "All scopes" %}</option>
-            {% for sc in scope_choices %}
-            <option value="{{ sc.value }}" {% if sc.value == scope_filter %}selected{% endif %}>{{ sc.label }}</option>
-            {% endfor %}
-          </select>
-          <select name="bottleneck" class="form-control mr-2 mb-1">
-            <option value="">{% translate "All bottlenecks" %}</option>
-            {% for bc in bottleneck_choices %}
-            <option value="{{ bc.type_id }}" {% if bc.type_id|stringformat:"s" == bottleneck_filter %}selected{% endif %}>{{ bc.name }}</option>
-            {% endfor %}
-          </select>
-          <select name="sort" class="form-control mr-2 mb-1">
-            {% for sk in sort_choices %}
-            <option value="{{ sk }}" {% if sk == sort_param %}selected{% endif %}>{% translate "Sort" %}: {{ sk }}</option>
-            <option value="-{{ sk }}" {% if "-"|add:sk == sort_param %}selected{% endif %}>{% translate "Sort" %}: -{{ sk }}</option>
-            {% endfor %}
-          </select>
-          <button type="submit" class="btn btn-secondary mb-1">{% translate "Apply" %}</button>
+        <form method="get" class="row g-2 align-items-end">
+          <div class="col-6 col-md-auto">
+            <label class="form-label small mb-1" for="mm-f-status">{% translate "Status" %}</label>
+            <select name="status" id="mm-f-status" class="form-select form-select-sm">
+              <option value="">{% translate "All statuses" %}</option>
+              {% for st in status_choices %}
+              <option value="{{ st }}" {% if st == status_filter %}selected{% endif %}>{{ st|upper }}</option>
+              {% endfor %}
+            </select>
+          </div>
+          <div class="col-6 col-md-auto">
+            <label class="form-label small mb-1" for="mm-f-scope">{% translate "Scope" %}</label>
+            <select name="scope" id="mm-f-scope" class="form-select form-select-sm">
+              <option value="">{% translate "All scopes" %}</option>
+              {% for sc in scope_choices %}
+              <option value="{{ sc.value }}" {% if sc.value == scope_filter %}selected{% endif %}>{{ sc.label }}</option>
+              {% endfor %}
+            </select>
+          </div>
+          <div class="col-6 col-md-auto">
+            <label class="form-label small mb-1" for="mm-f-bottleneck">{% translate "Bottleneck" %}</label>
+            <select name="bottleneck" id="mm-f-bottleneck" class="form-select form-select-sm">
+              <option value="">{% translate "All bottlenecks" %}</option>
+              {% for bc in bottleneck_choices %}
+              <option value="{{ bc.type_id }}" {% if bc.type_id|stringformat:"s" == bottleneck_filter %}selected{% endif %}>{{ bc.name }}</option>
+              {% endfor %}
+            </select>
+          </div>
+          <div class="col-6 col-md-auto">
+            <label class="form-label small mb-1" for="mm-f-sort">{% translate "Sort" %}</label>
+            <select name="sort" id="mm-f-sort" class="form-select form-select-sm">
+              {% for sk in sort_choices %}
+              <option value="{{ sk }}" {% if sk == sort_param %}selected{% endif %}>{{ sk }}</option>
+              <option value="-{{ sk }}" {% if "-"|add:sk == sort_param %}selected{% endif %}>&darr; {{ sk }}</option>
+              {% endfor %}
+            </select>
+          </div>
+          <div class="col-12 col-md-auto">
+            <button type="submit" class="btn btn-outline-secondary btn-sm w-100">{% translate "Apply" %}</button>
+          </div>
         </form>
       </div>
     </div>
   </div>
 </div>
 
+{# Таблица фитов (01-dashboard.md §4): единый каркас card → header → table-responsive. #}
 <div class="card">
-  <div class="card-header"><h3 class="card-title">{% translate "Fits" %} ({{ fit_count }})</h3></div>
+  <div class="card-header d-flex flex-wrap align-items-center gap-2">
+    <h3 class="card-title mb-0">{% translate "Fits" %}</h3>
+    <span class="badge text-bg-secondary">{{ fit_count }}</span>
+    {# Кнопка добавления живёт в шапке всегда (для edit-роли), а не только в пустом состоянии. #}
+    {% if can_edit %}
+    <a href="{% url 'marketmonitoring:fit_create' %}" class="btn btn-primary btn-sm ms-auto">{% translate "+ New fit" %}</a>
+    {% endif %}
+  </div>
   <div class="card-body table-responsive">
     {% if rows %}
-    <table class="table table-striped">
+    <table class="table table-sm table-hover align-middle mm-table">
       <thead>
         <tr>
           <th>{% translate "Fit" %}</th>
-          <th>{% translate "K / N" %}</th>
+          <th>{% translate "Collectability" %}</th>
           <th>{% translate "Status" %}</th>
-          <th>{% translate "Total cost" %}</th>
-          <th>{% translate "Overprice" %}</th>
+          <th class="text-end">{% translate "Total to buy" %}</th>
+          <th class="text-end">{% translate "Overprice" %}</th>
           <th>{% translate "Bottleneck" %}</th>
           <th>{% translate "Last check" %}</th>
         </tr>
@@ -96,36 +134,53 @@
       <tbody>
         {% for row in rows %}
         <tr>
-          <td><a href="{% url 'marketmonitoring:fit_detail' row.fit.pk %}">{{ row.fit.name }}</a></td>
-          <td>{{ row.fit.fits_available }} / {{ row.fit.qty_target }}</td>
+          <td class="mm-nowrap"><a href="{% url 'marketmonitoring:fit_detail' row.fit.pk %}">{{ row.fit.name }}</a></td>
           <td>
-            <span class="badge mm-badge-{{ row.fit.status_cache|status_class }}">{{ row.fit.get_status_cache_display }}</span>
-            {% if row.fit.fits_available is not None %}
-            <div class="progress mm-progress">
+            {% if row.fit.status_cache == 'ok' or row.fit.status_cache == 'deficit' %}
+            <span class="mm-num fw-semibold">{{ row.fit.fits_available }} <span class="text-body-secondary">{% translate "of" %} {{ row.fit.qty_target }}</span></span>
+            <div class="progress mm-progress mt-1">
               <div class="progress-bar bg-{{ row.fit.status_cache|status_class }}"
                    style="width: {% widthratio row.fit.fits_available row.fit.qty_target 100 %}%"></div>
             </div>
+            {% else %}
+            &mdash;
             {% endif %}
           </td>
-          <td>{% if row.fit.status_cache == 'no_data' %}&mdash;{% else %}{{ row.fit.total_cost|isk }} ISK{% endif %}</td>
-          <td>{{ row.fit.overprice_count|default_if_none:0 }}</td>
+          <td><span class="badge text-bg-{{ row.fit.status_cache|status_class }}">{{ row.fit.get_status_cache_display }}</span></td>
+          <td class="mm-num">{% if row.fit.status_cache == 'no_data' or row.fit.status_cache == 'hull_missing' %}&mdash;{% else %}{{ row.fit.total_cost|isk }} <span class="text-body-secondary">ISK</span>{% endif %}</td>
+          <td class="mm-num">{% if row.fit.overprice_count %}<span class="badge text-bg-warning">{{ row.fit.overprice_count }}</span>{% else %}&mdash;{% endif %}</td>
           <td>{% bottleneck_line row.bottleneck_names row.bottleneck_extra %}</td>
-          <td>{{ row.fit.last_checked_at|date:"Y-m-d H:i" }}</td>
+          <td class="mm-nowrap">{{ row.fit.last_checked_at|date:"Y-m-d H:i" }}</td>
         </tr>
         {% endfor %}
       </tbody>
     </table>
+    {% elif has_any_fits %}
+    {# Пустое состояние: фильтр отсеял всё (07-states.md §4). #}
+    <div class="text-center py-4">
+      <i class="fas fa-filter text-body-secondary fs-2 d-block mb-2" aria-hidden="true"></i>
+      <p class="mb-2">{% translate "Nothing matches the current filters." %}</p>
+      <a href="{% url 'marketmonitoring:index' %}" class="btn btn-outline-secondary btn-sm">{% translate "Clear filters" %}</a>
+    </div>
     {% else %}
-    <p>{% translate "No fits yet." %}</p>
+    {# Пустое состояние: фитов нет вовсе (07-states.md §4). #}
+    <div class="text-center py-4">
+      <i class="fas fa-box-open text-body-secondary fs-2 d-block mb-2" aria-hidden="true"></i>
+      <p class="mb-2">{% translate "No fits yet. Paste an EFT to start tracking." %}</p>
+      {% if can_edit %}
+      <a href="{% url 'marketmonitoring:fit_create' %}" class="btn btn-primary btn-sm">{% translate "+ New fit" %}</a>
+      {% else %}
+      <p class="text-body-secondary small mb-0">{% translate "Ask your logistics manager to add fits." %}</p>
+      {% endif %}
+    </div>
     {% endif %}
   </div>
 </div>
 
-{% if can_edit %}
+{# Поллинг refresh_status (07-states.md §3): vanilla fetch, view-роль видит индикатор без кнопки. #}
 <script>
 (function () {
   var btn = document.getElementById("mm-refresh-btn");
-  if (!btn) return;
   var status = document.getElementById("mm-refresh-status");
   var started = Date.now();
   function poll() {
@@ -137,14 +192,20 @@
           window.location.reload();
           return;
         }
-        if (Date.now() - started > 5 * 60 * 1000) { return; }
+        status.classList.remove("d-none");
+        if (btn) { btn.disabled = true; }
+        if (Date.now() - started > 5 * 60 * 1000) {
+          status.classList.add("d-none");
+          return; // «Still running in background; reload later» — нейтрально, без ошибки.
+        }
         window.setTimeout(poll, 3000);
       })
-      .catch(function () {});
+      .catch(function () { window.setTimeout(poll, 3000); });
   }
-  if (btn.disabled) { poll(); return; }
-  btn.addEventListener("click", function () { started = Date.now(); poll(); });
+  if (btn && btn.disabled) { poll(); return; }
+  if (btn) {
+    btn.addEventListener("click", function () { started = Date.now(); poll(); });
+  }
 })();
 </script>
-{% endif %}
 {% endblock %}

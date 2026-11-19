@@ -1,30 +1,40 @@
-{% extends "public/base.html" %}
-{% load i18n %}
+{% extends "allianceauth/base-bs5.html" %}
+{% load i18n static mm_tags %}
 {% block title %}{{ page_title }}{% endblock %}
 
 {% block page_title %}{{ page_title }}{% endblock %}
 
 {% block content %}
+<link rel="stylesheet" href="{% static 'marketmonitoring/css/mm.css' %}">
+{# Форма компонента (04-components.md): SDE-селектор типа поиском, qty, scope, note. #}
 <div class="card card-primary">
-  <div class="card-header"><h3 class="card-title">{{ page_title }}</h3></div>
+  <div class="card-header">
+    <h3 class="card-title mb-0">
+      <a href="{% url 'marketmonitoring:components' %}" class="text-decoration-none">&larr;</a>
+      {{ page_title }}
+    </h3>
+  </div>
   <div class="card-body">
-    <form method="post">
+    <form method="post" class="row g-2">
       {% csrf_token %}
       {{ form.non_field_errors }}
-      <div class="form-group">
-        <label>{% translate "Type (search by name)" %}</label>
+      <div class="col-12 col-md-8">
+        <label class="form-label" for="type-search">{% translate "Type (search by name)" %}</label>
         <input type="text" id="type-search" class="form-control" autocomplete="off" placeholder="{% translate 'Start typing a type name' %}">
         <select id="type-search-results" class="form-control mt-1" size="5" style="display:none"></select>
+        <div class="invalid-feedback d-block" {% if form.type_id.errors %}style="display:block"{% else %}style="display:none"{% endif %}>
+          {{ form.type_id.errors }}{% if not form.type_id.errors %}{% translate "Type not found" %}{% endif %}
+        </div>
       </div>
-      <div class="form-group">
-        {{ form.type_id.label_tag }} {{ form.type_id }} {{ form.type_id.errors }}
+      <div class="col-12 col-md-4">{{ form.type_id }} {{ form.type_id.errors }}</div>
+      <div class="col-6 col-md-3 mm-num">{{ form.qty_target.label_tag }} {{ form.qty_target }} {{ form.qty_target.errors }}</div>
+      <div class="col-6 col-md-3">{{ form.scope_kind.label_tag }} {{ form.scope_kind }} {{ form.scope_kind.errors }}</div>
+      <div class="col-6 col-md-3">{{ form.scope_ref.label_tag }} {{ form.scope_ref }} {{ form.scope_ref.errors }}</div>
+      <div class="col-12">{{ form.note.label_tag }} {{ form.note }} {{ form.note.errors }}</div>
+      <div class="col-12 d-flex gap-2">
+        <button type="submit" class="btn btn-primary btn-sm">{% translate "Save" %}</button>
+        <a href="{% url 'marketmonitoring:components' %}" class="btn btn-outline-secondary btn-sm">{% translate "Cancel" %}</a>
       </div>
-      {{ form.qty_target.label_tag }} {{ form.qty_target }} {{ form.qty_target.errors }}
-      {{ form.scope_kind.label_tag }} {{ form.scope_kind }} {{ form.scope_kind.errors }}
-      {{ form.scope_ref.label_tag }} {{ form.scope_ref }} {{ form.scope_ref.errors }}
-      {{ form.note.label_tag }} {{ form.note }} {{ form.note.errors }}
-      <button type="submit" class="btn btn-primary mt-2">{% translate "Save" %}</button>
-      <a href="{% url 'marketmonitoring:components' %}" class="btn btn-secondary mt-2">{% translate "Back" %}</a>
     </form>
   </div>
 </div>

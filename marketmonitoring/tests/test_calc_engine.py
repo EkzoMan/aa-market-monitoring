@@ -65,8 +65,10 @@ def sde_ids(db):
     group = None
     from eveuniverse.models import EveCategory, EveGroup
 
-    category = EveCategory.objects.create(id=6, name="Ship", published=True)
-    group = EveGroup.objects.create(id=1, name="ShipGroup", eve_category=category, published=True)
+    category, _ = EveCategory.objects.get_or_create(id=6, defaults={"name": "Ship", "published": True})
+    group, _ = EveGroup.objects.get_or_create(
+        id=1, defaults={"name": "ShipGroup", "eve_category": category, "published": True}
+    )
     eve_type = EveType.objects.create(
         id=1,
         name="Ferox",

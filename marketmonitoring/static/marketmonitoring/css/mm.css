@@ -1,0 +1,50 @@
+/*
+ * Utility-CSS плагина marketmonitoring (дизайн-спека docs/design/README.md §2, §4, §8).
+ * Только семантические токены Bootstrap (var(--bs-*)) — тема AA (светлая/тёмная)
+ * подхватывается автоматически. Никаких жёстких hex-цветов.
+ */
+
+/* Числовая типографика: табличные цифры, правое выравнивание (README §4). */
+.mm-num {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum";
+  text-align: right;
+}
+
+/* Тонкий прогресс-бар «K из N» в таблицах (README §2). */
+.mm-progress {
+  height: 0.5rem;
+  min-width: 90px;
+}
+
+/* Крупный прогресс в шапке карточки фита (02-fit-detail.md). */
+.mm-progress-lg {
+  height: 0.75rem;
+  min-width: 160px;
+}
+
+/* Строка корпуса в таблице компонентов (02-fit-detail.md): акцентная полоса слева,
+   полупрозрачный фон через Bootstrap-токены, не ломает выравнивание чисел. */
+.mm-hull-row > td:first-child {
+  border-left: 3px solid var(--bs-primary);
+  font-weight: 600;
+  background-color: var(--bs-tertiary-bg);
+}
+
+/* Sticky-заголовок таблиц (README §8): работает и внутри .table-responsive. */
+.mm-table thead th {
+  position: sticky;
+  top: 0;
+  background: var(--bs-body-bg);
+  z-index: 1;
+}
+
+/* Имена и числа не сжимать при мобильном скролле (07-states.md §6). */
+.mm-nowrap {
+  white-space: nowrap;
+}
+
+/* Контейнер toast «Скопировано» (README §5). */
+.mm-toast-container {
+  z-index: 2000;
+}

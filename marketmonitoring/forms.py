@@ -241,7 +241,9 @@ class WebhookForm(forms.ModelForm):
     url = forms.URLField(
         label=_("Webhook URL"),
         required=False,
-        widget=forms.URLInput(attrs={"class": "form-control"}),
+        # §16 / 06-settings.md: значение webhook URL не вставляется в DOM как текст —
+        # PasswordInput (render_value=False по умолчанию) отдаёт пустой input.
+        widget=forms.PasswordInput(attrs={"class": "form-control", "autocomplete": "off"}),
     )
 
     class Meta:

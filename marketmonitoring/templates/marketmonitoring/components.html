@@ -1,44 +1,62 @@
-{% extends "public/base.html" %}
-{% load i18n mm_tags %}
+{% extends "allianceauth/base-bs5.html" %}
+{% load i18n static mm_tags %}
 {% block title %}{% translate "Components" %}{% endblock %}
 
 {% block page_title %}{% translate "Components" %}{% endblock %}
 
 {% block content %}
+<link rel="stylesheet" href="{% static 'marketmonitoring/css/mm.css' %}">
+
+{# Единый каркас (04-components.md): card → header (заголовок + действия) → summary strip → table-responsive. #}
 <div class="card card-primary">
-  <div class="card-header">
-    <h3 class="card-title">{% translate "Components outside fits" %}</h3>
-  </div>
-  <div class="card-body">
+  <div class="card-header d-flex flex-wrap align-items-center gap-2">
+    <h3 class="card-title mb-0 me-auto">
+      <a href="{% url 'marketmonitoring:index' %}" class="text-decoration-none">&larr;</a>
+      {% translate "Components" %}
+    </h3>
     {% if can_edit %}
-    <a href="{% url 'marketmonitoring:component_create' %}" class="btn btn-primary btn-sm mb-2">{% translate "Add component" %}</a>
+    <a href="{% url 'marketmonitoring:component_create' %}" class="btn btn-primary btn-sm">
+      <i class="fas fa-plus me-1" aria-hidden="true"></i>{% translate "New component" %}
+    </a>
     {% endif %}
+  </div>
+  <div class="card-body table-responsive">
     {% if rows %}
-    <table class="table table-striped">
+    {# Summary strip (04-components.md): компонентов с дефицитом + суммарная стоимость. #}
+    {% if deficit_count == 0 %}
+    <p class="text-success mb-0"><i class="fas fa-check me-1" aria-hidden="true"></i>{% translate "All components are stocked. Nothing to buy." %}</p>
+    {% else %}
+    <p class="mb-2">
+      {% blocktranslate count counter=deficit_count %}{{ counter }} component with deficit{% plural %}{{ counter }} components with deficit{% endblocktranslate %}
+      &middot; <span class="mm-num fw-semibold">{{ deficit_total|isk }} <span class="text-body-secondary">ISK</span></span>
+    </p>
+    {% endif %}
+    <table class="table table-sm table-hover align-middle mm-table">
       <thead>
         <tr>
           <th>{% translate "Type" %}</th>
-          <th>{% translate "Target qty" %}</th>
+          <th class="text-end">{% translate "Target qty" %}</th>
           <th>{% translate "Scope" %}</th>
           <th>{% translate "Status" %}</th>
-          <th>{% translate "Deficit" %}</th>
-          <th>{% translate "Cost" %}</th>
-          {% if can_edit %}<th></th>{% endif %}
+          <th class="text-end">{% translate "Deficit" %}</th>
+          <th class="text-end">{% translate "Cost" %}</th>
+          {% if can_edit %}<th>{% translate "Note" %}</th><th></th>{% endif %}
         </tr>
       </thead>
       <tbody>
         {% for row in rows %}
-        <tr>
-          <td>{{ row.type_name }}</td>
-          <td>{{ row.obj.qty_target }}</td>
+        <tr {% if row.deficit is not None and row.deficit == 0 and row.status != 'no_data' %}class="text-body-secondary"{% endif %}>
+          <td class="mm-nowrap">{{ row.type_name }}</td>
+          <td class="mm-num">{{ row.obj.qty_target }}</td>
           <td>{{ row.obj.get_scope_kind_display }} {{ row.obj.scope_ref }}</td>
-          <td><span class="badge mm-badge-{{ row.status|status_class }}">{{ row.status|upper }}</span></td>
-          <td>{{ row.deficit|default_if_none:"—" }}</td>
-          <td>{% if row.status == 'no_data' %}&mdash;{% else %}{{ row.cost|isk }} ISK{% endif %}</td>
+          <td><span class="badge text-bg-{{ row.status|status_class }}">{{ row.status|upper }}</span></td>
+          <td class="mm-num">{{ row.deficit|default_if_none:"—" }}</td>
+          <td class="mm-num">{% if row.status == 'no_data' %}&mdash;{% else %}{{ row.cost|isk }}{% endif %}</td>
           {% if can_edit %}
-          <td>
-            <a href="{% url 'marketmonitoring:component_update' row.obj.pk %}" class="btn btn-secondary btn-sm">{% translate "Edit" %}</a>
-            <a href="{% url 'marketmonitoring:component_delete' row.obj.pk %}" class="btn btn-danger btn-sm">{% translate "Delete" %}</a>
+          <td class="text-truncate" style="max-width: 200px" title="{{ row.obj.note }}">{{ row.obj.note|default:"—" }}</td>
+          <td class="mm-nowrap">
+            <a href="{% url 'marketmonitoring:component_update' row.obj.pk %}" class="btn btn-outline-secondary btn-sm" title="{% translate 'Edit' %}" aria-label="{% translate 'Edit' %}"><i class="fas fa-pen" aria-hidden="true"></i></a>
+            <a href="{% url 'marketmonitoring:component_delete' row.obj.pk %}" class="btn btn-outline-danger btn-sm" title="{% translate 'Delete' %}" aria-label="{% translate 'Delete' %}"><i class="fas fa-trash" aria-hidden="true"></i></a>
           </td>
           {% endif %}
         </tr>
@@ -46,7 +64,13 @@
       </tbody>
     </table>
     {% else %}
-    <p>{% translate "No components yet." %}</p>
+    <div class="text-center py-4">
+      <i class="fas fa-box-open text-body-secondary fs-2 d-block mb-2" aria-hidden="true"></i>
+      <p class="mb-2">{% translate "No standalone components yet." %}</p>
+      {% if can_edit %}
+      <a href="{% url 'marketmonitoring:component_create' %}" class="btn btn-primary btn-sm">{% translate "+ New component" %}</a>
+      {% endif %}
+    </div>
     {% endif %}
   </div>
 </div>

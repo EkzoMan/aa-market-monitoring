@@ -3,6 +3,7 @@
 from decimal import ROUND_HALF_UP, Decimal
 
 from django import template
+from django.utils.translation import gettext as _
 
 register = template.Library()
 
@@ -54,10 +55,22 @@ def status_class(status: str) -> str:
     }.get(status, "secondary")
 
 
+@register.filter
+def sync_status_class(status: str) -> str:
+    """Цвет чипа статуса синка локации (05-locations.md): ok зелёный, сбой красный, stale оранжевый, прочее серый."""
+    return {
+        "ok": "success",
+        "error": "danger",
+        "no_acl": "danger",
+        "no_provider": "secondary",
+        "stale": "warning",
+    }.get(status, "secondary")
+
+
 @register.simple_tag
 def bottleneck_line(names: list, extra_count: int = 0) -> str:
     """Строка узких мест (§14): до 5 имён типов, при большем числе — «и ещё N»."""
     shown = [str(name) for name in names[:5]]
     if extra_count > 0:
-        shown.append(f"+ {extra_count} more")
+        shown.append(_("+ %(count)s more") % {"count": extra_count})
     return ", ".join(shown) if shown else "—"

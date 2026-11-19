@@ -1,46 +1,71 @@
-{% extends "public/base.html" %}
-{% load i18n %}
+{% extends "allianceauth/base-bs5.html" %}
+{% load i18n static mm_tags %}
 {% block title %}{{ page_title }}{% endblock %}
 
 {% block page_title %}{{ page_title }}{% endblock %}
 
 {% block content %}
+<link rel="stylesheet" href="{% static 'marketmonitoring/css/mm.css' %}">
+
+{# Настройки (06-settings.md): карточки PRICING / SYNC / NOTIFICATIONS + провайдеры; CSRF в каждой форме. #}
 <div class="card card-primary">
-  <div class="card-header"><h3 class="card-title">{% translate "Plugin settings" %}</h3></div>
+  <div class="card-header d-flex flex-wrap align-items-center gap-2">
+    <h3 class="card-title mb-0">{% translate "Settings" %}</h3>
+  </div>
   <div class="card-body">
     <form method="post">
       {% csrf_token %}
       {{ settings_form.non_field_errors }}
-      <div class="row">
+      {% if messages %}
+      {% for message in messages %}
+      <div class="alert alert-{{ message.tags|default:'info' }} py-2">{{ message }}</div>
+      {% endfor %}
+      {% endif %}
+
+      <h5 class="mt-2">{% translate "Pricing" %}</h5>
+      <div class="row g-2 mb-3">
         {% for field in settings_form %}
-        <div class="col-md-4 form-group">
-          {{ field.label_tag }} {{ field }} {{ field.errors }}
-          {% if field.help_text %}<small class="form-text text-muted">{{ field.help_text }}</small>{% endif %}
+        <div class="col-12 col-md-3">
+          {{ field.label_tag }}
+          <div class="input-group input-group-sm mm-num">
+            {{ field }} {{ field.errors }}
+          </div>
+          {% if field.help_text %}<small class="form-text text-body-secondary">{{ field.help_text }}</small>{% endif %}
         </div>
         {% endfor %}
       </div>
-      <h5 class="mt-3">{% translate "Discord webhook" %}</h5>
+
+      {# Вебхук: URL не рендерится как текст — PasswordInput без значения (§16, 06-settings.md). #}
+      <h5>{% translate "Notifications" %}</h5>
       {{ webhook_form.non_field_errors }}
-      {# webhook_url виден только с правом _edit (§16) — страница целиком edit-only. #}
-      <div class="form-group">{{ webhook_form.url.label_tag }} {{ webhook_form.url }} {{ webhook_form.url.errors }}</div>
-      <div class="form-group">{{ webhook_form.enabled.label_tag }} {{ webhook_form.enabled }} {{ webhook_form.enabled.errors }}</div>
-      <button type="submit" class="btn btn-primary">{% translate "Save settings" %}</button>
+      <div class="row g-2 mb-3">
+        <div class="col-12 col-md-6">
+          {{ webhook_form.url.label_tag }} {{ webhook_form.url }} {{ webhook_form.url.errors }}
+          <small class="form-text text-body-secondary">{% translate "The stored URL is never displayed in the page." %}</small>
+        </div>
+        <div class="col-12 col-md-3">
+          {{ webhook_form.enabled.label_tag }} {{ webhook_form.enabled }} {{ webhook_form.enabled.errors }}
+        </div>
+      </div>
+
+      <button type="submit" class="btn btn-primary btn-sm">{% translate "Save" %}</button>
     </form>
   </div>
 </div>
 
-<div class="card">
+<div class="card mt-3">
   <div class="card-header"><h3 class="card-title">{% translate "Structure providers" %}</h3></div>
-  <div class="card-body">
+  <div class="card-body table-responsive">
     {% if providers %}
-    <table class="table table-striped">
+    <table class="table table-sm table-hover align-middle mm-table">
       <thead>
         <tr>
+          <th>#</th>
           <th>{% translate "Character" %}</th>
           <th>{% translate "Priority" %}</th>
           <th>{% translate "Enabled" %}</th>
           <th>{% translate "Status" %}</th>
-          <th>{% translate "ACL failures" %}</th>
+          <th class="text-end">{% translate "ACL failures" %}</th>
           <th>{% translate "Last verified" %}</th>
           <th></th>
         </tr>
@@ -48,21 +73,24 @@
       <tbody>
         {% for provider in providers %}
         <tr>
-          <td>{{ provider.character }}</td>
-          <td>{{ provider.priority }}</td>
-          <td>{{ provider.enabled|yesno:"✔,✘" }}</td>
-          <td>{{ provider.status }}</td>
-          <td>{{ provider.acl_fail_count }}</td>
-          <td>{{ provider.last_verified_at|date:"Y-m-d H:i" }}</td>
+          <td>{{ forloop.counter }}</td>
+          <td class="mm-nowrap">{{ provider.character }}</td>
+          <td class="mm-num">{{ provider.priority }}</td>
           <td>
-            <form method="post" action="{% url 'marketmonitoring:provider_toggle' provider.pk %}" class="d-inline">
+            <form method="post" action="{% url 'marketmonitoring:provider_toggle' provider.pk %}" class="form-check form-switch m-0">
               {% csrf_token %}
-              <button type="submit" class="btn btn-secondary btn-sm">{% translate "Toggle" %}</button>
+              <input type="checkbox" class="form-check-input" role="switch" {{ provider.enabled|yesno:"checked," }}
+                     onchange="this.form.submit()" aria-label="{% translate 'Enabled' %}">
             </form>
+          </td>
+          <td><span class="badge text-bg-{{ provider.status|sync_status_class }}">{{ provider.status }}</span></td>
+          <td class="mm-num">{{ provider.acl_fail_count }}</td>
+          <td class="mm-nowrap">{{ provider.last_verified_at|date:"Y-m-d H:i" }}</td>
+          <td>
             {% if provider.status == provider_status_disabled %}
             <form method="post" action="{% url 'marketmonitoring:provider_enable' provider.pk %}" class="d-inline">
               {% csrf_token %}
-              <button type="submit" class="btn btn-primary btn-sm">{% translate "Re-enable" %}</button>
+              <button type="submit" class="btn btn-outline-primary btn-sm">{% translate "Re-enable" %}</button>
             </form>
             {% endif %}
           </td>
@@ -71,18 +99,22 @@
       </tbody>
     </table>
     {% else %}
-    <p>{% translate "No providers yet." %}</p>
+    <p class="text-body-secondary">{% translate "No providers yet." %}</p>
     {% endif %}
 
     <h5 class="mt-3">{% translate "Add provider" %}</h5>
-    <form method="post" action="{% url 'marketmonitoring:provider_add' %}" class="form-inline">
+    <form method="post" action="{% url 'marketmonitoring:provider_add' %}" class="row g-2 align-items-end">
       {% csrf_token %}
       {{ provider_form.non_field_errors }}
-      {{ provider_form.character }} {{ provider_form.character.errors }}
-      <button type="submit" class="btn btn-primary ml-2">{% translate "Add" %}</button>
-      <small class="form-text text-muted ml-2">
-        {% translate "The character must have the scopes esi-markets.structure_markets.v1 and esi-universe.read_structures.v1." %}
-      </small>
+      <div class="col-12 col-md-5">{{ provider_form.character }} {{ provider_form.character.errors }}</div>
+      <div class="col-12 col-md-auto">
+        <button type="submit" class="btn btn-primary btn-sm">{% translate "Add" %}</button>
+      </div>
+      <div class="col-12">
+        <small class="form-text text-body-secondary">
+          {% translate "The character must have the scopes esi-markets.structure_markets.v1 and esi-universe.read_structures.v1." %}
+        </small>
+      </div>
     </form>
   </div>
 </div>

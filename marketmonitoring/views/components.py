@@ -4,6 +4,7 @@ UI обращается только к БД плагина и справочн�
 """
 
 import logging
+from decimal import Decimal
 
 from django.contrib import messages
 from django.contrib.auth.decorators import login_required
@@ -49,9 +50,13 @@ def components(request):
                 "cost": row["cost"],
             }
         )
+    # Сводная строка (04-components.md): сколько компонентов с дефицитом и суммарная стоимость.
+    deficit_rows = [row for row in rows if row["deficit"] is not None and row["deficit"] > 0]
     context = {
         "page_title": _("Components"),
         "rows": rows,
+        "deficit_count": len(deficit_rows),
+        "deficit_total": sum((row["cost"] for row in deficit_rows if row["cost"]), Decimal("0")),
         "can_edit": has_edit(request.user),
     }
     return render(request, "marketmonitoring/components.html", context)

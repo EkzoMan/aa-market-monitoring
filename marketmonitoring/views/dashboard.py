@@ -20,8 +20,9 @@ from ..calc import engine
 from ..calc.engine import ComponentInput
 from ..calc.service import resolve_scope_ids
 from ..constants import FitStatus, ScopeKind
-from ..models import Fit, FitComponent, StockLevel, SyncRun
+from ..models import ComponentRequest, Fit, FitComponent, StockLevel, SyncRun
 from ..tasks import SYNC_LOCK_KEY
+from ._calc_view import build_component_request_rows
 
 logger = logging.getLogger("marketmonitoring")
 
@@ -129,8 +130,9 @@ def index(request):
         # Пользователь аутентифицирован, но права просмотра нет — отказ (§14).
         # redirect на marketmonitoring:index невозможен (это сам index) —
         # стандартный выход: страница входа (login_required-семантика).
+        # AA5 не регистрирует namespace «auth» — имя страницы входа: auth_login_user.
         messages.warning(request, _("Permission denied."))
-        return redirect("auth:login")
+        return redirect("auth_login_user")
 
     from eveuniverse.models import EveType
 
@@ -143,7 +145,7 @@ def index(request):
     if status_filter in FitStatus.values:
         fits = fits.filter(status_cache=status_filter)
     if ":" in scope_filter:
-        scope_kind, _, scope_ref = scope_filter.partition(":")
+        scope_kind, _sep, scope_ref = scope_filter.partition(":")
         if scope_kind in ScopeKind.values and scope_ref.isdigit():
             fits = fits.filter(scope_kind=scope_kind, scope_ref=int(scope_ref))
 
@@ -175,6 +177,15 @@ def index(request):
     no_data_count = sum(1 for fit in fits if fit.status_cache == FitStatus.NO_DATA)
     hull_missing_count = sum(1 for fit in fits if fit.status_cache == FitStatus.HULL_MISSING)
 
+    # Перекрёстная сводка Dashboard ↔ Components (§14.4): счётчик и сумма компонентов
+    # с дефицитом; полный список живёт на странице Components, здесь — только агрегат.
+    component_rows = build_component_request_rows(list(ComponentRequest.objects.all()))
+    deficit_component_count = sum(1 for row in component_rows if row["deficit"] is not None and row["deficit"] > 0)
+    deficit_component_total = sum(
+        (row["cost"] for row in component_rows if row["deficit"] is not None and row["deficit"] > 0 and row["cost"]),
+        Decimal("0"),
+    )
+
     scope_pairs = list(Fit.objects.values_list("scope_kind", "scope_ref").distinct())
     scope_labels = _scope_labels(scope_pairs)
     scope_choices = sorted({f"{kind}:{ref}" for kind, ref in scope_pairs})
@@ -202,6 +213,9 @@ def index(request):
         "total_to_buy": total_to_buy,
         "no_data_count": no_data_count,
         "hull_missing_count": hull_missing_count,
+        "deficit_component_count": deficit_component_count,
+        "deficit_component_total": deficit_component_total,
+        "has_any_fits": Fit.objects.exists(),
         "in_progress": cache.get(SYNC_LOCK_KEY) is not None,
         "last_checked_at": Fit.objects.aggregate(Max("last_checked_at"))["last_checked_at__max"],
         "last_run": SyncRun.objects.order_by("-started_at").first(),
