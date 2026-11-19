@@ -1,0 +1,58 @@
+{% extends "public/base.html" %}
+{% load i18n %}
+{% block title %}{{ page_title }}{% endblock %}
+
+{% block page_title %}{{ page_title }}{% endblock %}
+
+{% block content %}
+<div class="card card-primary">
+    <div class="card-header">
+        <h3 class="card-title">{% translate "Fit" %}</h3>
+    </div>
+    <div class="card-body">
+        {% if parse_errors %}
+        <div class="alert alert-danger">
+            <ul>
+            {% for error in parse_errors %}
+                <li>{{ error.line_no }}: {{ error.line }} — {{ error.message }}</li>
+            {% endfor %}
+            </ul>
+        </div>
+        {% endif %}
+
+        <form method="post">
+            {% csrf_token %}
+            {{ form.as_p }}
+
+            {% if parsed %}
+            <h4>{% translate "Parsed components" %}</h4>
+            <table class="table table-striped">
+                <thead>
+                    <tr>
+                        <th>{% translate "Type ID" %}</th>
+                        <th>{% translate "Qty per fit" %}</th>
+                        <th>{% translate "Charge" %}</th>
+                        <th>{% translate "Hull" %}</th>
+                        <th>{% translate "Raw line" %}</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for item in parsed %}
+                    <tr>
+                        <td>{{ item.type_id }}</td>
+                        <td>{{ item.qty_per_fit }}</td>
+                        <td>{{ item.is_charge|yesno:"yes,no" }}</td>
+                        <td>{{ item.is_hull|yesno:"yes,no" }}</td>
+                        <td><code>{{ item.raw_line }}</code></td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+            {% endif %}
+
+            <button class="btn btn-default" name="action" value="parse">{% translate "Parse" %}</button>
+            <button class="btn btn-primary" name="action" value="save">{% translate "Save" %}</button>
+        </form>
+    </div>
+</div>
+{% endblock %}

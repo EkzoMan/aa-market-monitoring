@@ -1,0 +1,16 @@
+[project]
+name = "aa-market-monitoring"
+version = "1.0.0"
+description = "Market monitoring plugin for Alliance Auth: fit availability, deficit and Jita buyback cost."
+requires-python = ">=3.11"
+dependencies = [
+    "allianceauth>=5.0,<6.0",
+    "django-eveuniverse>=1.5",
+    "requests>=2.31",
+]
+
+[tool.black]
+line-length = 120
+
+[tool.isort]
+profile = "black"

@@ -1,0 +1,161 @@
+{% extends "public/base.html" %}
+{% load i18n %}
+{% block title %}{% translate "Locations" %}{% endblock %}
+
+{% block page_title %}{% translate "Locations" %}{% endblock %}
+
+{% block content %}
+<div class="mb-2">
+  <form method="post" action="{% url 'marketmonitoring:refresh' %}" class="d-inline">
+    {% csrf_token %}
+    <button type="submit" class="btn btn-primary btn-sm">{% translate "Refresh now" %}</button>
+  </form>
+</div>
+<div class="card card-primary">
+  <div class="card-header"><h3 class="card-title">{% translate "Monitored locations" %}</h3></div>
+  <div class="card-body">
+    {% if locations %}
+    <table class="table table-striped">
+      <thead>
+        <tr>
+          <th>{% translate "Name" %}</th>
+          <th>{% translate "Kind" %}</th>
+          <th>{% translate "Sync status" %}</th>
+          <th>{% translate "Last sync" %}</th>
+          <th>{% translate "Enabled" %}</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for loc in locations %}
+        <tr>
+          <td>{{ loc.name }}</td>
+          <td>{{ loc.get_kind_display }}</td>
+          <td>{{ loc.sync_status }}</td>
+          <td>{{ loc.last_synced_at|date:"Y-m-d H:i" }}</td>
+          <td>{{ loc.enabled|yesno:"✔,✘" }}</td>
+          <td>
+            <form method="post" action="{% url 'marketmonitoring:location_toggle' loc.pk %}" class="d-inline">
+              {% csrf_token %}
+              <button type="submit" class="btn btn-secondary btn-sm">{% translate "Toggle" %}</button>
+            </form>
+            <a href="{% url 'marketmonitoring:location_delete' loc.pk %}" class="btn btn-danger btn-sm">{% translate "Delete" %}</a>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <p>{% translate "No locations yet." %}</p>
+    {% endif %}
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-header"><h3 class="card-title">{% translate "Add location" %}</h3></div>
+  <div class="card-body">
+    <form method="post">
+      {% csrf_token %}
+      {{ form.non_field_errors }}
+      <div class="form-group">{{ form.kind.label_tag }} {{ form.kind }} {{ form.kind.errors }}</div>
+      <div class="form-group">
+        {{ form.solar_system_id.label_tag }}
+        <input type="text" id="system-search" class="form-control" autocomplete="off" placeholder="{% translate 'Start typing a system name' %}">
+        <select id="system-search-results" class="form-control mt-1" size="5" style="display:none"></select>
+        {{ form.solar_system_id }}
+        {{ form.region_id }}
+        {{ form.solar_system_id.errors }}
+      </div>
+      <div class="form-group mm-station-only">
+        {{ form.station_id.label_tag }}
+        <input type="text" id="station-search" class="form-control" autocomplete="off" placeholder="{% translate 'Start typing a station name' %}">
+        <select id="station-search-results" class="form-control mt-1" size="5" style="display:none"></select>
+        {{ form.station_id }}
+        {{ form.station_id.errors }}
+      </div>
+      <div class="form-group mm-structure-only">
+        {{ form.structure_id.label_tag }} {{ form.structure_id }} {{ form.structure_id.errors }}
+        {{ form.structure_name.label_tag }} {{ form.structure_name }} {{ form.structure_name.errors }}
+        <small class="form-text text-muted">
+          {% translate "The real structure name is fetched from ESI during the first sync (the UI itself never calls ESI)." %}
+        </small>
+      </div>
+      <button type="submit" class="btn btn-primary">{% translate "Add" %}</button>
+    </form>
+  </div>
+</div>
+
+<script>
+(function () {
+  var kind = document.getElementById("id_kind");
+  function update() {
+    var isStructure = kind.value === "{{ kind_structure }}";
+    document.querySelectorAll(".mm-station-only").forEach(function (el) { el.style.display = isStructure ? "none" : "block"; });
+    document.querySelectorAll(".mm-structure-only").forEach(function (el) { el.style.display = isStructure ? "block" : "none"; });
+  }
+  kind.addEventListener("change", update);
+  update();
+
+  var systemInput = document.getElementById("system-search");
+  var systemBox = document.getElementById("system-search-results");
+  var systemId = document.getElementById("id_solar_system_id");
+  var timer = null;
+  systemBox.addEventListener("change", function () {
+    systemId.value = systemBox.value;
+    systemInput.value = systemBox.selectedOptions[0].textContent;
+    systemBox.style.display = "none";
+  });
+  systemInput.addEventListener("input", function () {
+    window.clearTimeout(timer);
+    var q = systemInput.value.trim();
+    if (q.length < 2) { systemBox.style.display = "none"; return; }
+    timer = window.setTimeout(function () {
+      fetch("{% url 'marketmonitoring:system_search' %}?q=" + encodeURIComponent(q))
+        .then(function (r) { return r.json(); })
+        .then(function (data) {
+          systemBox.innerHTML = "";
+          (data.results || []).forEach(function (r) {
+            var opt = document.createElement("option");
+            opt.value = r.id;
+            opt.textContent = r.name;
+            systemBox.appendChild(opt);
+          });
+          systemBox.style.display = data.results && data.results.length ? "block" : "none";
+        })
+        .catch(function () {});
+    }, 300);
+  });
+
+  var stationInput = document.getElementById("station-search");
+  var stationBox = document.getElementById("station-search-results");
+  var stationId = document.getElementById("id_station_id");
+  var stationTimer = null;
+  stationBox.addEventListener("change", function () {
+    stationId.value = stationBox.value;
+    stationInput.value = stationBox.selectedOptions[0].textContent;
+    stationBox.style.display = "none";
+  });
+  stationInput.addEventListener("input", function () {
+    window.clearTimeout(stationTimer);
+    var q = stationInput.value.trim();
+    var sys = systemId.value ? "&system_id=" + encodeURIComponent(systemId.value) : "";
+    if (q.length < 2) { stationBox.style.display = "none"; return; }
+    stationTimer = window.setTimeout(function () {
+      fetch("{% url 'marketmonitoring:station_search' %}?q=" + encodeURIComponent(q) + sys)
+        .then(function (r) { return r.json(); })
+        .then(function (data) {
+          stationBox.innerHTML = "";
+          (data.results || []).forEach(function (r) {
+            var opt = document.createElement("option");
+            opt.value = r.id;
+            opt.textContent = r.name;
+            stationBox.appendChild(opt);
+          });
+          stationBox.style.display = data.results && data.results.length ? "block" : "none";
+        })
+        .catch(function () {});
+    }, 300);
+  });
+})();
+</script>
+{% endblock %}

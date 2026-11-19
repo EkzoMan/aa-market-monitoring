@@ -1,0 +1,89 @@
+{% extends "public/base.html" %}
+{% load i18n %}
+{% block title %}{{ page_title }}{% endblock %}
+
+{% block page_title %}{{ page_title }}{% endblock %}
+
+{% block content %}
+<div class="card card-primary">
+  <div class="card-header"><h3 class="card-title">{% translate "Plugin settings" %}</h3></div>
+  <div class="card-body">
+    <form method="post">
+      {% csrf_token %}
+      {{ settings_form.non_field_errors }}
+      <div class="row">
+        {% for field in settings_form %}
+        <div class="col-md-4 form-group">
+          {{ field.label_tag }} {{ field }} {{ field.errors }}
+          {% if field.help_text %}<small class="form-text text-muted">{{ field.help_text }}</small>{% endif %}
+        </div>
+        {% endfor %}
+      </div>
+      <h5 class="mt-3">{% translate "Discord webhook" %}</h5>
+      {{ webhook_form.non_field_errors }}
+      {# webhook_url виден только с правом _edit (§16) — страница целиком edit-only. #}
+      <div class="form-group">{{ webhook_form.url.label_tag }} {{ webhook_form.url }} {{ webhook_form.url.errors }}</div>
+      <div class="form-group">{{ webhook_form.enabled.label_tag }} {{ webhook_form.enabled }} {{ webhook_form.enabled.errors }}</div>
+      <button type="submit" class="btn btn-primary">{% translate "Save settings" %}</button>
+    </form>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-header"><h3 class="card-title">{% translate "Structure providers" %}</h3></div>
+  <div class="card-body">
+    {% if providers %}
+    <table class="table table-striped">
+      <thead>
+        <tr>
+          <th>{% translate "Character" %}</th>
+          <th>{% translate "Priority" %}</th>
+          <th>{% translate "Enabled" %}</th>
+          <th>{% translate "Status" %}</th>
+          <th>{% translate "ACL failures" %}</th>
+          <th>{% translate "Last verified" %}</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for provider in providers %}
+        <tr>
+          <td>{{ provider.character }}</td>
+          <td>{{ provider.priority }}</td>
+          <td>{{ provider.enabled|yesno:"✔,✘" }}</td>
+          <td>{{ provider.status }}</td>
+          <td>{{ provider.acl_fail_count }}</td>
+          <td>{{ provider.last_verified_at|date:"Y-m-d H:i" }}</td>
+          <td>
+            <form method="post" action="{% url 'marketmonitoring:provider_toggle' provider.pk %}" class="d-inline">
+              {% csrf_token %}
+              <button type="submit" class="btn btn-secondary btn-sm">{% translate "Toggle" %}</button>
+            </form>
+            {% if provider.status == provider_status_disabled %}
+            <form method="post" action="{% url 'marketmonitoring:provider_enable' provider.pk %}" class="d-inline">
+              {% csrf_token %}
+              <button type="submit" class="btn btn-primary btn-sm">{% translate "Re-enable" %}</button>
+            </form>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <p>{% translate "No providers yet." %}</p>
+    {% endif %}
+
+    <h5 class="mt-3">{% translate "Add provider" %}</h5>
+    <form method="post" action="{% url 'marketmonitoring:provider_add' %}" class="form-inline">
+      {% csrf_token %}
+      {{ provider_form.non_field_errors }}
+      {{ provider_form.character }} {{ provider_form.character.errors }}
+      <button type="submit" class="btn btn-primary ml-2">{% translate "Add" %}</button>
+      <small class="form-text text-muted ml-2">
+        {% translate "The character must have the scopes esi-markets.structure_markets.v1 and esi-universe.read_structures.v1." %}
+      </small>
+    </form>
+  </div>
+</div>
+{% endblock %}

@@ -1,0 +1,53 @@
+{% extends "public/base.html" %}
+{% load i18n mm_tags %}
+{% block title %}{% translate "Components" %}{% endblock %}
+
+{% block page_title %}{% translate "Components" %}{% endblock %}
+
+{% block content %}
+<div class="card card-primary">
+  <div class="card-header">
+    <h3 class="card-title">{% translate "Components outside fits" %}</h3>
+  </div>
+  <div class="card-body">
+    {% if can_edit %}
+    <a href="{% url 'marketmonitoring:component_create' %}" class="btn btn-primary btn-sm mb-2">{% translate "Add component" %}</a>
+    {% endif %}
+    {% if rows %}
+    <table class="table table-striped">
+      <thead>
+        <tr>
+          <th>{% translate "Type" %}</th>
+          <th>{% translate "Target qty" %}</th>
+          <th>{% translate "Scope" %}</th>
+          <th>{% translate "Status" %}</th>
+          <th>{% translate "Deficit" %}</th>
+          <th>{% translate "Cost" %}</th>
+          {% if can_edit %}<th></th>{% endif %}
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in rows %}
+        <tr>
+          <td>{{ row.type_name }}</td>
+          <td>{{ row.obj.qty_target }}</td>
+          <td>{{ row.obj.get_scope_kind_display }} {{ row.obj.scope_ref }}</td>
+          <td><span class="badge mm-badge-{{ row.status|status_class }}">{{ row.status|upper }}</span></td>
+          <td>{{ row.deficit|default_if_none:"—" }}</td>
+          <td>{% if row.status == 'no_data' %}&mdash;{% else %}{{ row.cost|isk }} ISK{% endif %}</td>
+          {% if can_edit %}
+          <td>
+            <a href="{% url 'marketmonitoring:component_update' row.obj.pk %}" class="btn btn-secondary btn-sm">{% translate "Edit" %}</a>
+            <a href="{% url 'marketmonitoring:component_delete' row.obj.pk %}" class="btn btn-danger btn-sm">{% translate "Delete" %}</a>
+          </td>
+          {% endif %}
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <p>{% translate "No components yet." %}</p>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}

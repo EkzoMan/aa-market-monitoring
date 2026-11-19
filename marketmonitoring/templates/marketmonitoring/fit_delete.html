@@ -1,0 +1,21 @@
+{% extends "public/base.html" %}
+{% load i18n %}
+{% block title %}{{ page_title }}{% endblock %}
+
+{% block page_title %}{{ page_title }}{% endblock %}
+
+{% block content %}
+<div class="card card-danger">
+    <div class="card-header">
+        <h3 class="card-title">{% translate "Delete fit" %}: {{ fit.name }}</h3>
+    </div>
+    <div class="card-body">
+        <p>{% translate "Are you sure you want to delete this fit?" %}</p>
+        <form method="post">
+            {% csrf_token %}
+            <button class="btn btn-danger">{% translate "Confirm delete" %}</button>
+            <a class="btn btn-default" href="{% url 'marketmonitoring:index' %}">{% translate "Cancel" %}</a>
+        </form>
+    </div>
+</div>
+{% endblock %}

@@ -1,0 +1,150 @@
+{% extends "public/base.html" %}
+{% load i18n mm_tags %}
+{% block title %}{% translate "Market Monitoring" %}{% endblock %}
+
+{% block page_title %}{% translate "Market Monitoring" %}{% endblock %}
+
+{% block content %}
+<style>
+  .mm-progress { height: 1rem; min-width: 90px; }
+  .mm-badge-ok { background-color: #28a745; color: #fff; }
+  .mm-badge-deficit { background-color: #fd7e14; color: #fff; }
+  .mm-badge-hull { background-color: #dc3545; color: #fff; }
+  .mm-badge-nodata { background-color: #6c757d; color: #fff; }
+</style>
+
+<div class="row mb-3">
+  <div class="col-md-4">
+    <div class="card card-primary">
+      <div class="card-header"><h3 class="card-title">{% translate "Summary" %}</h3></div>
+      <div class="card-body">
+        <p>{% translate "Total to buy" %}: <strong>{{ total_to_buy|isk }} ISK</strong></p>
+        {% if no_data_count %}
+        <p class="text-muted">{% translate "NO_DATA fits are not included in the sum." %} ({{ no_data_count }})</p>
+        {% endif %}
+        {% if hull_missing_count %}
+        <p class="text-danger">{% translate "HULL_MISSING fits" %}: {{ hull_missing_count }}</p>
+        {% endif %}
+        <p class="text-muted">{% translate "Last checked" %}: {{ last_checked_at|date:"Y-m-d H:i" }}</p>
+        {% if last_run %}
+        <p class="text-muted">{% translate "Last sync" %}: {{ last_run.task_name }} ({{ last_run.status }})</p>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+  <div class="col-md-8">
+    <div class="card">
+      <div class="card-body">
+        {% if can_edit %}
+        <form method="post" action="{% url 'marketmonitoring:refresh' %}" class="mb-3">
+          {% csrf_token %}
+          <button type="submit" id="mm-refresh-btn" class="btn btn-primary"
+                  {% if in_progress %}disabled{% endif %}>
+            {% if in_progress %}{% translate "Update is running..." %}{% else %}{% translate "Refresh now" %}{% endif %}
+          </button>
+          <span id="mm-refresh-status" class="text-muted"></span>
+        </form>
+        {% endif %}
+        <form method="get" class="form-inline">
+          <select name="status" class="form-control mr-2 mb-1">
+            <option value="">{% translate "All statuses" %}</option>
+            {% for st in status_choices %}
+            <option value="{{ st }}" {% if st == status_filter %}selected{% endif %}>{{ st|upper }}</option>
+            {% endfor %}
+          </select>
+          <select name="scope" class="form-control mr-2 mb-1">
+            <option value="">{% translate "All scopes" %}</option>
+            {% for sc in scope_choices %}
+            <option value="{{ sc.value }}" {% if sc.value == scope_filter %}selected{% endif %}>{{ sc.label }}</option>
+            {% endfor %}
+          </select>
+          <select name="bottleneck" class="form-control mr-2 mb-1">
+            <option value="">{% translate "All bottlenecks" %}</option>
+            {% for bc in bottleneck_choices %}
+            <option value="{{ bc.type_id }}" {% if bc.type_id|stringformat:"s" == bottleneck_filter %}selected{% endif %}>{{ bc.name }}</option>
+            {% endfor %}
+          </select>
+          <select name="sort" class="form-control mr-2 mb-1">
+            {% for sk in sort_choices %}
+            <option value="{{ sk }}" {% if sk == sort_param %}selected{% endif %}>{% translate "Sort" %}: {{ sk }}</option>
+            <option value="-{{ sk }}" {% if "-"|add:sk == sort_param %}selected{% endif %}>{% translate "Sort" %}: -{{ sk }}</option>
+            {% endfor %}
+          </select>
+          <button type="submit" class="btn btn-secondary mb-1">{% translate "Apply" %}</button>
+        </form>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-header"><h3 class="card-title">{% translate "Fits" %} ({{ fit_count }})</h3></div>
+  <div class="card-body table-responsive">
+    {% if rows %}
+    <table class="table table-striped">
+      <thead>
+        <tr>
+          <th>{% translate "Fit" %}</th>
+          <th>{% translate "K / N" %}</th>
+          <th>{% translate "Status" %}</th>
+          <th>{% translate "Total cost" %}</th>
+          <th>{% translate "Overprice" %}</th>
+          <th>{% translate "Bottleneck" %}</th>
+          <th>{% translate "Last check" %}</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in rows %}
+        <tr>
+          <td><a href="{% url 'marketmonitoring:fit_detail' row.fit.pk %}">{{ row.fit.name }}</a></td>
+          <td>{{ row.fit.fits_available }} / {{ row.fit.qty_target }}</td>
+          <td>
+            <span class="badge mm-badge-{{ row.fit.status_cache|status_class }}">{{ row.fit.get_status_cache_display }}</span>
+            {% if row.fit.fits_available is not None %}
+            <div class="progress mm-progress">
+              <div class="progress-bar bg-{{ row.fit.status_cache|status_class }}"
+                   style="width: {% widthratio row.fit.fits_available row.fit.qty_target 100 %}%"></div>
+            </div>
+            {% endif %}
+          </td>
+          <td>{% if row.fit.status_cache == 'no_data' %}&mdash;{% else %}{{ row.fit.total_cost|isk }} ISK{% endif %}</td>
+          <td>{{ row.fit.overprice_count|default_if_none:0 }}</td>
+          <td>{% bottleneck_line row.bottleneck_names row.bottleneck_extra %}</td>
+          <td>{{ row.fit.last_checked_at|date:"Y-m-d H:i" }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <p>{% translate "No fits yet." %}</p>
+    {% endif %}
+  </div>
+</div>
+
+{% if can_edit %}
+<script>
+(function () {
+  var btn = document.getElementById("mm-refresh-btn");
+  if (!btn) return;
+  var status = document.getElementById("mm-refresh-status");
+  var started = Date.now();
+  function poll() {
+    fetch("{% url 'marketmonitoring:refresh_status' %}")
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
+        if (!data.in_progress) {
+          status.textContent = "{% translate 'Update finished.' %}";
+          window.location.reload();
+          return;
+        }
+        if (Date.now() - started > 5 * 60 * 1000) { return; }
+        window.setTimeout(poll, 3000);
+      })
+      .catch(function () {});
+  }
+  if (btn.disabled) { poll(); return; }
+  btn.addEventListener("click", function () { started = Date.now(); poll(); });
+})();
+</script>
+{% endif %}
+{% endblock %}

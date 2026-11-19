@@ -1,0 +1,121 @@
+{% extends "public/base.html" %}
+{% load i18n mm_tags %}
+{% block title %}{{ fit.name }}{% endblock %}
+
+{% block page_title %}{{ fit.name }}{% endblock %}
+
+{% block content %}
+<style>
+  .mm-badge-ok { background-color: #28a745; color: #fff; }
+  .mm-badge-deficit { background-color: #fd7e14; color: #fff; }
+  .mm-badge-hull { background-color: #dc3545; color: #fff; }
+  .mm-badge-nodata { background-color: #6c757d; color: #fff; }
+</style>
+<div class="card card-primary">
+  <div class="card-header">
+    <h3 class="card-title">
+      <span class="badge mm-badge-{{ status|status_class }}">{{ status|upper }}</span>
+      {% if k is not None %}K = {{ k }} / {{ fit.qty_target }}{% else %}K = ? / {{ fit.qty_target }}{% endif %}
+      &mdash; {{ total_cost|isk }} ISK
+    </h3>
+  </div>
+  <div class="card-body">
+    <p>{% translate "Scope" %}: {{ fit.get_scope_kind_display }} {{ fit.scope_ref }}</p>
+    {% if reasons %}
+    <div class="alert alert-secondary">
+      <strong>{% translate "NO_DATA reasons" %}:</strong>
+      <ul>
+        {% for reason in reasons %}<li>{{ reason }}</li>{% endfor %}
+      </ul>
+    </div>
+    {% endif %}
+    {% if can_edit %}
+    <a href="{% url 'marketmonitoring:fit_update' fit.pk %}" class="btn btn-secondary btn-sm">{% translate "Edit" %}</a>
+    <a href="{% url 'marketmonitoring:fit_delete' fit.pk %}" class="btn btn-danger btn-sm">{% translate "Delete" %}</a>
+    {% endif %}
+    {# Кнопки экспорта — маршруты объявлены этапом 5, реализация — этап 7 (§14.3). #}
+    <a href="{{ export_txt_url }}" class="btn btn-primary btn-sm">{% translate "Export .txt" %}</a>
+    <a href="{{ export_csv_url }}" class="btn btn-primary btn-sm">{% translate "Export .csv" %}</a>
+    {# Копирование multibuy в буфер (§14.3): текст с сервера, Clipboard API. #}
+    <button type="button" id="mm-multibuy-btn" class="btn btn-success btn-sm"
+            data-url="{{ export_multibuy_url }}">{% translate "Copy multibuy" %}</button>
+    <span id="mm-multibuy-status" class="text-muted ml-2"></span>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-header"><h3 class="card-title">{% translate "Components" %}</h3></div>
+  <div class="card-body table-responsive">
+    <table class="table table-striped">
+      <thead>
+        <tr>
+          <th>{% translate "Component" %}</th>
+          <th>{% translate "Qty / fit" %}</th>
+          <th>{% translate "Scope" %}</th>
+          <th>{% translate "Required (N x q)" %}</th>
+          <th>{% translate "Available" %}</th>
+          <th>{% translate "Deficit" %}</th>
+          <th>{% translate "Shortfall" %}</th>
+          <th>{% translate "Unit" %}</th>
+          <th>{% translate "Ref" %}</th>
+          <th>{% translate "Cost" %}</th>
+          <th>{% translate "Badge" %}</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in rows %}
+        <tr {% if row.is_hull %}class="table-secondary font-weight-bold"{% endif %}>
+          <td>
+            {{ row.type_name }}
+            {% if row.is_hull %}<span class="badge badge-dark">{% translate "HULL" %}</span>{% endif %}
+            {% if row.is_bottleneck and row.deficit > 0 %}<span class="badge badge-warning">{% translate "BOTTLENECK" %}</span>{% endif %}
+          </td>
+          <td>{{ row.component.qty_per_fit }}</td>
+          <td>{{ row.scope_label }}</td>
+          <td>{{ row.required }}</td>
+          <td>{{ row.available }}</td>
+          <td>{% if row.no_data %}&mdash;{% else %}{{ row.deficit }}{% endif %}</td>
+          <td>{% if row.is_not_covered and not row.no_data %}{{ row.shortfall }}{% else %}&mdash;{% endif %}</td>
+          <td>{% if row.unit is not None %}{{ row.unit|isk }}{% else %}&mdash;{% endif %}</td>
+          <td>{% if row.ref is not None %}{{ row.ref|isk }}{% else %}&mdash;{% endif %}</td>
+          <td>{% if row.no_data %}&mdash;{% else %}{{ row.cost|isk }} ISK{% endif %}</td>
+          <td>
+            {% if row.is_not_covered %}
+            <span class="badge badge-danger" title="{% translate 'Shortfall' %}: {{ row.shortfall }}">{% translate "NOT_COVERED" %}</span>
+            {% elif row.is_overprice %}
+            <span class="badge badge-warning">{% translate "OVERPRICE" %}</span>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+{# Копирование multibuy (§14.3): Clipboard API, подтверждение «Скопировано», без CDN. #}
+<script>
+  (function () {
+    var btn = document.getElementById("mm-multibuy-btn");
+    var status = document.getElementById("mm-multibuy-status");
+    if (!btn) return;
+    btn.addEventListener("click", function () {
+      fetch(btn.dataset.url, {credentials: "same-origin"})
+        .then(function (r) { return r.json(); })
+        .then(function (data) {
+          if (data.empty) {
+            status.textContent = "{% translate 'No positions to buy' %}";
+            return;
+          }
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            return navigator.clipboard.writeText(data.text).then(function () {
+              status.textContent = "{% translate 'Copied' %}";
+            });
+          }
+          status.textContent = "{% translate 'Clipboard API unavailable' %}";
+        })
+        .catch(function () { status.textContent = "{% translate 'Copy failed' %}"; });
+    });
+  })();
+</script>
+{% endblock %}

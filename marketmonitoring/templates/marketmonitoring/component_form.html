@@ -1,0 +1,68 @@
+{% extends "public/base.html" %}
+{% load i18n %}
+{% block title %}{{ page_title }}{% endblock %}
+
+{% block page_title %}{{ page_title }}{% endblock %}
+
+{% block content %}
+<div class="card card-primary">
+  <div class="card-header"><h3 class="card-title">{{ page_title }}</h3></div>
+  <div class="card-body">
+    <form method="post">
+      {% csrf_token %}
+      {{ form.non_field_errors }}
+      <div class="form-group">
+        <label>{% translate "Type (search by name)" %}</label>
+        <input type="text" id="type-search" class="form-control" autocomplete="off" placeholder="{% translate 'Start typing a type name' %}">
+        <select id="type-search-results" class="form-control mt-1" size="5" style="display:none"></select>
+      </div>
+      <div class="form-group">
+        {{ form.type_id.label_tag }} {{ form.type_id }} {{ form.type_id.errors }}
+      </div>
+      {{ form.qty_target.label_tag }} {{ form.qty_target }} {{ form.qty_target.errors }}
+      {{ form.scope_kind.label_tag }} {{ form.scope_kind }} {{ form.scope_kind.errors }}
+      {{ form.scope_ref.label_tag }} {{ form.scope_ref }} {{ form.scope_ref.errors }}
+      {{ form.note.label_tag }} {{ form.note }} {{ form.note.errors }}
+      <button type="submit" class="btn btn-primary mt-2">{% translate "Save" %}</button>
+      <a href="{% url 'marketmonitoring:components' %}" class="btn btn-secondary mt-2">{% translate "Back" %}</a>
+    </form>
+  </div>
+</div>
+
+<script>
+(function () {
+  var input = document.getElementById("type-search");
+  var box = document.getElementById("type-search-results");
+  var typeId = document.getElementById("id_type_id");
+  if (!input || !box) return;
+  var timer = null;
+  function render(results) {
+    box.innerHTML = "";
+    if (!results.length) { box.style.display = "none"; return; }
+    results.forEach(function (r) {
+      var opt = document.createElement("option");
+      opt.value = r.type_id;
+      opt.textContent = r.name + " (" + r.type_id + ")";
+      box.appendChild(opt);
+    });
+    box.style.display = "block";
+  }
+  box.addEventListener("change", function () {
+    typeId.value = box.value;
+    input.value = box.selectedOptions[0].textContent;
+    box.style.display = "none";
+  });
+  input.addEventListener("input", function () {
+    window.clearTimeout(timer);
+    var q = input.value.trim();
+    if (q.length < 2) { box.style.display = "none"; return; }
+    timer = window.setTimeout(function () {
+      fetch("{% url 'marketmonitoring:type_search' %}?q=" + encodeURIComponent(q))
+        .then(function (r) { return r.json(); })
+        .then(function (data) { render(data.results || []); })
+        .catch(function () {});
+    }, 300);
+  });
+})();
+</script>
+{% endblock %}
