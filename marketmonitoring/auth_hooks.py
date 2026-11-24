@@ -12,6 +12,7 @@ VIEW_PERMISSION_CODENAMES = [
     "view_componentrequest",
     "view_marketlocation",
     "view_structureprovider",
+    "view_contractprovider",
     "view_pluginsetting",
     "view_webhookconfig",
 ]
@@ -33,6 +34,9 @@ EDIT_PERMISSION_CODENAMES = [
     "add_structureprovider",
     "change_structureprovider",
     "delete_structureprovider",
+    "add_contractprovider",
+    "change_contractprovider",
+    "delete_contractprovider",
     "add_pluginsetting",
     "change_pluginsetting",
     "delete_pluginsetting",
@@ -74,6 +78,7 @@ def assign_permissions() -> None:
 
     from .models import (
         ComponentRequest,
+        ContractProvider,
         Fit,
         FitComponent,
         MarketLocation,
@@ -88,6 +93,7 @@ def assign_permissions() -> None:
         ComponentRequest,
         MarketLocation,
         StructureProvider,
+        ContractProvider,
         PluginSetting,
         WebhookConfig,
     ]

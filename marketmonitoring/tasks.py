@@ -14,6 +14,8 @@ from django.db import transaction
 from django.utils import timezone
 
 from .constants import (
+    ContractFitStatus,
+    ContractSourceKind,
     LocationKind,
     NotificationEvent,
     ScopeKind,
@@ -25,6 +27,9 @@ from .constants import (
 from .esi import client as esi_client
 from .esi.selectors import get_calc_type_ids, get_sync_region_ids
 from .models import (
+    ContractCache,
+    ContractItemCache,
+    ContractProvider,
     Fit,
     FitComponent,
     JitaOrderLevel,
@@ -66,7 +71,6 @@ def build_beat_schedule() -> dict:
     чаще, чем разрешено, даже при более частом beat-тике.
     """
     every_five_minutes = {
-        "task": name,
         "schedule": BEAT_SYNC_INTERVAL_SECONDS,
         "options": {"trigger": TriggerKind.BEAT},
     }
@@ -76,6 +80,10 @@ def build_beat_schedule() -> dict:
         "marketmonitoring-sync-structure-orders": {
             **every_five_minutes,
             "task": "marketmonitoring.sync_structure_orders",
+        },
+        "marketmonitoring-sync-contracts": {
+            **every_five_minutes,
+            "task": "marketmonitoring.sync_contracts",
         },
         "marketmonitoring-verify-providers": every_five_minutes | {"task": "marketmonitoring.verify_providers"},
         "marketmonitoring-notify-deficit": every_five_minutes | {"task": "marketmonitoring.notify_deficit"},
@@ -288,8 +296,10 @@ def _chain_recalc_and_notify(trigger: str, location_ids: list[int] | None, lock_
     для снятия блокировки ручного запуска (§12.4).
     """
     recalc_stock_levels.delay(trigger=trigger, location_ids=location_ids, lock_token=lock_token)
-    if trigger == TriggerKind.BEAT and PluginSetting.load().notification_deficit_enabled:
-        notify_deficit.delay(trigger=trigger)
+    if trigger == TriggerKind.BEAT:
+        settings_obj = PluginSetting.load()
+        if settings_obj.notification_deficit_enabled or settings_obj.notification_contracts_deficit_enabled:
+            notify_deficit.delay(trigger=trigger)
 
 
 @shared_task(name="marketmonitoring.search_structures")
@@ -545,6 +555,212 @@ def _update_structure_name(location: MarketLocation, provider) -> None:
         location.save(update_fields=["name"])
 
 
+def _upsert_contracts_source(
+    *,
+    source_kind: str,
+    source_ref: int,
+    active_rows: list[dict],
+    fetched_items_by_cid: dict[int, list],
+    partial: bool,
+) -> int:
+    """Атомарное обновление ContractCache/ContractItemCache по источнику (§6.12, §12.5).
+
+    При полном срезе (``partial=False``) удаляет контракты этого источника, которые
+    перестали быть ``outstanding``/``item_exchange`` или истекли. Позиции ``items``
+    вставляются один раз при первой загрузке ``contract_id`` (решение №35).
+    """
+    active_cids = {row["contract_id"] for row in active_rows}
+    processed = 0
+    with transaction.atomic():
+        if not partial:
+            ContractCache.objects.filter(source_kind=source_kind, source_ref=source_ref).exclude(
+                contract_id__in=active_cids
+            ).delete()
+        existing = {c.contract_id: c for c in ContractCache.objects.filter(contract_id__in=active_cids)}
+        existing_with_items = set(
+            ContractItemCache.objects.filter(contract__contract_id__in=active_cids)
+            .values_list("contract__contract_id", flat=True)
+            .distinct()
+        )
+        new_item_objs: list[ContractItemCache] = []
+        for row in active_rows:
+            cid = row["contract_id"]
+            if cid not in existing_with_items and cid not in fetched_items_by_cid:
+                # Если лимит ESI прервал догрузку items нового контракта — не пишем полупустую шапку.
+                continue
+            cached = existing.get(cid)
+            if cached is None:
+                cached = ContractCache.objects.create(**row)
+                existing[cid] = cached
+            else:
+                for field, value in row.items():
+                    if field in ("contract_id", "source_kind", "source_ref"):
+                        continue
+                    setattr(cached, field, value)
+                cached.save()
+            processed += 1
+            if cid not in existing_with_items and cid in fetched_items_by_cid:
+                item_dicts = esi_client.build_contract_item_rows(fetched_items_by_cid[cid], contract_pk=cached.pk)
+                new_item_objs.extend(ContractItemCache(**d) for d in item_dicts)
+                existing_with_items.add(cid)
+        if new_item_objs:
+            ContractItemCache.objects.bulk_create(new_item_objs, batch_size=2000)
+    return processed
+
+
+@shared_task(bind=True, name="marketmonitoring.sync_contracts")
+def sync_contracts(self, trigger: str = TriggerKind.BEAT, lock_token: str | None = None) -> dict:
+    """Синхронизация открытых item_exchange контрактов корпораций/персонажей (§6.12, §12.1).
+
+    Guard-интервал ``contracts_sync_interval_min``. Для каждого включённого
+    ``ContractProvider`` тянет список контрактов (корпоративных + альянсовых или
+    персональных), фильтрует ``status=outstanding``, ``type=item_exchange``,
+    ``date_expired > now``, запрашивает ``items`` только для новых ``contract_id``
+    (решение №35), обновляет кэш и запускает ``recalc_stock_levels`` → ``notify_deficit``.
+    """
+    from esi.exceptions import HTTPClientError
+
+    from .providers import service as provider_service
+
+    settings_obj = PluginSetting.load()
+    last = (
+        SyncRun.objects.filter(task_name="marketmonitoring.sync_contracts", trigger=TriggerKind.BEAT)
+        .order_by("-started_at")
+        .values_list("started_at", flat=True)
+        .first()
+    )
+    if trigger == TriggerKind.BEAT and not _interval_expired(last, settings_obj.contracts_sync_interval_min):
+        return {"skipped": True}
+    run = _start_run("marketmonitoring.sync_contracts", trigger)
+    providers = list(provider_service.available_contract_providers())
+    ok = failed = items_processed = 0
+    errors: list[str] = []
+    partial_any = False
+    try:
+        # Очистка глобально истёкших контрактов до обхода провайдеров.
+        ContractCache.objects.filter(date_expired__lte=timezone.now()).delete()
+        seen_sources: set[tuple[str, int]] = set()
+        for provider in providers:
+            char_id = provider.character.character_id
+            if provider.source_kind == ContractSourceKind.CORPORATION:
+                corp_id = provider.character.corporation_id
+                if not corp_id:
+                    failed += 1
+                    provider.sync_status = SyncStatus.ERROR
+                    provider.save(update_fields=["sync_status"])
+                    errors.append(f"contract provider {char_id}: missing corporation_id")
+                    continue
+                source_key = (ContractSourceKind.CORPORATION, int(corp_id))
+            else:
+                source_key = (ContractSourceKind.CHARACTER, int(char_id))
+            if source_key in seen_sources:
+                # Тот же источник в этом прогоне уже успешно синхронизирован более приоритетным провайдером.
+                provider.sync_status = SyncStatus.OK
+                provider.last_synced_at = timezone.now()
+                provider.save(update_fields=["sync_status", "last_synced_at"])
+                ok += 1
+                continue
+            try:
+                if provider.source_kind == ContractSourceKind.CORPORATION:
+                    raw_contracts, partial = esi_client.fetch_corporation_contracts(source_key[1], char_id)
+                else:
+                    raw_contracts, partial = esi_client.fetch_character_contracts(char_id)
+            except HTTPClientError as exc:
+                status_code = getattr(exc, "status_code", None)
+                if status_code in (401, 403):
+                    provider_service.handle_contract_provider_acl_failure(provider)
+                    provider.sync_status = SyncStatus.NO_ACL
+                    provider.save(update_fields=["sync_status"])
+                    failed += 1
+                    errors.append(f"contract provider {char_id} ({provider.source_kind}): ACL {status_code}")
+                    continue
+                provider.sync_status = SyncStatus.ERROR
+                provider.save(update_fields=["sync_status"])
+                failed += 1
+                errors.append(f"contract provider {char_id} ({provider.source_kind}): HTTP {status_code}: {exc}")
+                logger.warning("Contract sync via provider %s failed: %s", char_id, exc)
+                continue
+            except ValueError as exc:
+                provider.sync_status = SyncStatus.NO_ACL
+                provider.save(update_fields=["sync_status"])
+                failed += 1
+                errors.append(f"contract provider {char_id} ({provider.source_kind}): {exc}")
+                logger.warning("Contract provider %s has no valid token: %s", char_id, exc)
+                continue
+
+            now = timezone.now()
+            dedup_by_cid: dict[int, dict] = {}
+            for raw in raw_contracts:
+                row = esi_client.build_contract_cache_row(
+                    raw, source_kind=source_key[0], source_ref=source_key[1], now=now
+                )
+                if row is not None:
+                    dedup_by_cid[row["contract_id"]] = row
+            active_rows = list(dedup_by_cid.values())
+
+            already_have_items = set(
+                ContractItemCache.objects.filter(contract__contract_id__in=dedup_by_cid.keys())
+                .values_list("contract__contract_id", flat=True)
+                .distinct()
+            )
+            fetched_items_by_cid: dict[int, list] = {}
+            items_partial = False
+            for cid in dedup_by_cid:
+                if cid in already_have_items:
+                    continue
+                try:
+                    if provider.source_kind == ContractSourceKind.CORPORATION:
+                        fetched_items_by_cid[cid] = esi_client.fetch_corporation_contract_items(
+                            source_key[1], cid, char_id
+                        )
+                    else:
+                        fetched_items_by_cid[cid] = esi_client.fetch_character_contract_items(cid, char_id)
+                except esi_client.RateLimitStop:
+                    items_partial = True
+                    break
+                except HTTPClientError as exc:
+                    status_code = getattr(exc, "status_code", None)
+                    errors.append(f"contract {cid} items HTTP {status_code}: {exc}")
+                    logger.warning("Contract %s items fetch failed: %s", cid, exc)
+                    items_partial = True
+
+            provider_service.handle_contract_provider_success(provider)
+            provider_partial = partial or items_partial
+            partial_any = partial_any or provider_partial
+            items_processed += _upsert_contracts_source(
+                source_kind=source_key[0],
+                source_ref=source_key[1],
+                active_rows=active_rows,
+                fetched_items_by_cid=fetched_items_by_cid,
+                partial=provider_partial,
+            )
+            provider.sync_status = SyncStatus.OK if not provider_partial else SyncStatus.ERROR
+            provider.last_synced_at = timezone.now()
+            provider.save(update_fields=["sync_status", "last_synced_at"])
+            if not provider_partial:
+                seen_sources.add(source_key)
+            ok += 1
+
+        _finish_run(
+            run,
+            status=(
+                SyncRunStatus.FAILED
+                if failed and not ok
+                else SyncRunStatus.PARTIAL if (failed or partial_any) else SyncRunStatus.OK
+            ),
+            locations_ok=ok,
+            locations_failed=failed,
+            items_processed=items_processed,
+            errors="\n".join(errors),
+        )
+        _chain_recalc_and_notify(trigger, [], lock_token=lock_token)
+        return {"ok": True, "providers_ok": ok, "providers_failed": failed, "contracts": items_processed}
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("sync_contracts failed")
+        _finish_run(run, status=SyncRunStatus.FAILED, errors=str(exc))
+        return {"ok": False, "error": str(exc)}
+
+
 @shared_task(bind=True, name="marketmonitoring.recalc_stock_levels")
 def recalc_stock_levels(
     self, trigger: str = TriggerKind.BEAT, location_ids: list[int] | None = None, lock_token: str | None = None
@@ -614,6 +830,32 @@ def cleanup_orphan_cache(self, trigger: str = TriggerKind.BEAT) -> dict:
             location_id__in=enabled_stations | enabled_structures
         )
         total += stale_stock.delete()[0] or 0
+        # Очистка истёкших контрактов и старого кэша отключённых провайдеров контрактов (§6.12, §12.1).
+        total += ContractCache.objects.filter(date_expired__lte=timezone.now()).delete()[0] or 0
+        enabled_corp_refs = {
+            cid
+            for cid in ContractProvider.objects.filter(
+                enabled=True, source_kind=ContractSourceKind.CORPORATION
+            ).values_list("character__corporation_id", flat=True)
+            if cid
+        }
+        enabled_char_refs = set(
+            ContractProvider.objects.filter(enabled=True, source_kind=ContractSourceKind.CHARACTER).values_list(
+                "character__character_id", flat=True
+            )
+        )
+        total += (
+            ContractCache.objects.filter(source_kind=ContractSourceKind.CORPORATION, fetched_at__lt=cutoff)
+            .exclude(source_ref__in=enabled_corp_refs)
+            .delete()[0]
+            or 0
+        )
+        total += (
+            ContractCache.objects.filter(source_kind=ContractSourceKind.CHARACTER, fetched_at__lt=cutoff)
+            .exclude(source_ref__in=enabled_char_refs)
+            .delete()[0]
+            or 0
+        )
         _finish_run(run, status=SyncRunStatus.OK, items_processed=total)
         return {"ok": True, "deleted": total}
     except Exception as exc:  # noqa: BLE001
@@ -733,6 +975,38 @@ def notify_deficit(self, trigger: str = TriggerKind.BEAT) -> dict:
                 continue
             result = recalc_fit(fit)
             if (
+                result.contracts_status == ContractFitStatus.DEFICIT
+                and result.contracts_available is not None
+                and settings_obj.notification_contracts_deficit_enabled
+            ):
+                contracts_scope_label = f"{fit.scope_kind} {fit.scope_ref}"
+                contracts_hash = discord.canonical_state_hash(
+                    {
+                        "event": NotificationEvent.CONTRACTS_DEFICIT,
+                        "fit_id": fit.pk,
+                        "contracts_available": result.contracts_available,
+                        "qty_target": fit.qty_target,
+                    }
+                )
+                if _deficit_notification_due(
+                    fit.pk,
+                    contracts_hash,
+                    settings_obj.notification_deficit_cooldown_min,
+                    event=NotificationEvent.CONTRACTS_DEFICIT,
+                ):
+                    ok_c, _err_c = discord.send_contracts_deficit(
+                        fit=fit,
+                        ships_available=result.contracts_available,
+                        n=fit.qty_target,
+                        scope_label=contracts_scope_label,
+                        state_hash=contracts_hash,
+                    )
+                    if ok_c:
+                        sent += 1
+                else:
+                    skipped += 1
+
+            if (
                 result.status == FitStatus.DEFICIT
                 and result.k is not None
                 and settings_obj.notification_deficit_enabled
@@ -800,17 +1074,18 @@ def notify_deficit(self, trigger: str = TriggerKind.BEAT) -> dict:
         return {"ok": False, "error": str(exc)}
 
 
-def _deficit_notification_due(fit_id: int, state_hash: str, cooldown_min: int) -> bool:
-    """Дедупликация deficit (§13.1): отправлять, если состояние изменилось с
-    последней ok-отправки ИЛИ прошло >= cooldown_min с неё при сохраняющемся
-    дефиците. Ни одной ok-отправки — отправлять."""
+def _deficit_notification_due(
+    fit_id: int,
+    state_hash: str,
+    cooldown_min: int,
+    event: str = NotificationEvent.DEFICIT,
+) -> bool:
+    """Дедупликация deficit / contracts_deficit (§13.1): отправлять, если состояние
+    изменилось с последней ok-отправки ИЛИ прошло >= cooldown_min с неё при
+    сохраняющемся дефиците. Ни одной ok-отправки — отправлять."""
     from .models import NotificationLog
 
-    last_ok = (
-        NotificationLog.objects.filter(event=NotificationEvent.DEFICIT, fit_id=fit_id, ok=True)
-        .order_by("-sent_at", "-id")
-        .first()
-    )
+    last_ok = NotificationLog.objects.filter(event=event, fit_id=fit_id, ok=True).order_by("-sent_at", "-id").first()
     if last_ok is None:
         return True
     if last_ok.state_hash != state_hash:

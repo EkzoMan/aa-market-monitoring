@@ -13,6 +13,69 @@
   <a href="{% url 'marketmonitoring:index' %}">&larr; {% translate "Back to dashboard" %}</a>
 </div>
 
+{# Приоритетный блок проверки кораблей в открытых контрактах (§6.12). #}
+<div class="card mb-3">
+  <div class="card-header d-flex flex-wrap align-items-center gap-2">
+    <h3 class="card-title mb-0 me-auto">{% translate "Ships on contracts" %}</h3>
+    <span class="badge text-bg-{{ contracts_status|status_class }}">{{ contracts_status|upper }}</span>
+    {% if contracts_available is not None %}
+    <span class="mm-num fw-semibold">{{ contracts_available }} <span class="text-body-secondary">{% translate "of" %} {{ fit.qty_target }}</span></span>
+    <div class="progress mm-progress-lg">
+      <div class="progress-bar bg-{{ contracts_status|status_class }}"
+           style="width: {% widthratio contracts_available fit.qty_target 100 %}%"></div>
+    </div>
+    {% if contracts_deficit %}
+    <span class="badge text-bg-warning">{% blocktranslate count counter=contracts_deficit %}Missing {{ counter }} ship{% plural %}Missing {{ counter }} ships{% endblocktranslate %}</span>
+    {% endif %}
+    {% else %}
+    <span class="mm-num fw-semibold">&mdash; <span class="text-body-secondary">{% translate "of" %} {{ fit.qty_target }}</span></span>
+    {% endif %}
+  </div>
+  {% if contracts_status == 'no_data' %}
+  <div class="alert alert-secondary mb-0">
+    <i class="fas fa-circle-info me-1" aria-hidden="true"></i>
+    {% translate "Contracts are not synced yet." %}
+    {% if can_edit %}<a href="{% url 'marketmonitoring:settings' %}">{% translate "Check Contract Providers" %}</a>{% endif %}
+    {% if contracts_reasons %}
+    <ul class="mb-0 mt-2">
+      {% for creason in contracts_reasons %}<li><code>{{ creason }}</code></li>{% endfor %}
+    </ul>
+    {% endif %}
+  </div>
+  {% elif contract_rows %}
+  <div class="card-body table-responsive">
+    <table class="table table-sm table-hover align-middle mm-table mb-0">
+      <thead>
+        <tr>
+          <th>{% translate "Contract ID" %}</th>
+          <th>{% translate "Title" %}</th>
+          <th>{% translate "Availability" %}</th>
+          <th class="text-end">{% translate "Full kits" %}</th>
+          <th class="text-end">{% translate "Price" %}</th>
+          <th>{% translate "Expires" %}</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for crow in contract_rows %}
+        <tr>
+          <td class="mm-num">{{ crow.contract.contract_id }}</td>
+          <td>{{ crow.contract.title|default:"—" }}</td>
+          <td><span class="badge text-bg-secondary">{{ crow.contract.availability }}</span></td>
+          <td class="mm-num fw-semibold">{{ crow.ships_count }}</td>
+          <td class="mm-num">{{ crow.contract.price|isk }} <span class="text-body-secondary">ISK</span></td>
+          <td class="mm-nowrap">{{ crow.contract.date_expired|date:"Y-m-d H:i" }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <div class="card-body py-2 text-body-secondary small">
+    {% translate "No matching full-kit outstanding item_exchange contracts in this fit scope." %}
+  </div>
+  {% endif %}
+</div>
+
 <div class="card card-primary">
   <div class="card-header">
     <div class="d-flex flex-wrap align-items-center gap-3">

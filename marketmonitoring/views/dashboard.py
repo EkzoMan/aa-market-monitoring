@@ -19,7 +19,7 @@ from ..auth_hooks import has_edit, has_view
 from ..calc import engine
 from ..calc.engine import ComponentInput
 from ..calc.service import resolve_scope_ids
-from ..constants import FitStatus, ScopeKind
+from ..constants import ContractFitStatus, FitStatus, ScopeKind
 from ..models import ComponentRequest, Fit, FitComponent, StockLevel, SyncRun
 from ..tasks import SYNC_LOCK_KEY
 from ._calc_view import build_component_request_rows
@@ -29,6 +29,7 @@ logger = logging.getLogger("marketmonitoring")
 # Допустимые сортировки (§14): поле → (asc, desc).
 SORT_CHOICES = {
     "name": ("name", "-name"),
+    "contracts": ("contracts_available", "-contracts_available"),
     "status": ("status_cache", "-status_cache"),
     "cost": ("total_cost", "-total_cost"),
     "k": ("fits_available", "-fits_available"),
@@ -138,18 +139,22 @@ def index(request):
 
     fits = Fit.objects.all()
     status_filter = request.GET.get("status") or ""
+    contracts_status_filter = request.GET.get("contracts_status") or ""
     scope_filter = request.GET.get("scope") or ""
     bottleneck_filter = request.GET.get("bottleneck") or ""
     sort_param = request.GET.get("sort") or "name"
 
     if status_filter in FitStatus.values:
         fits = fits.filter(status_cache=status_filter)
+    if contracts_status_filter in ContractFitStatus.values:
+        fits = fits.filter(contracts_status_cache=contracts_status_filter)
     if ":" in scope_filter:
         scope_kind, _sep, scope_ref = scope_filter.partition(":")
         if scope_kind in ScopeKind.values and scope_ref.isdigit():
             fits = fits.filter(scope_kind=scope_kind, scope_ref=int(scope_ref))
 
-    sort_asc, sort_desc = SORT_CHOICES.get(sort_param, SORT_CHOICES["name"])
+    sort_key = sort_param.lstrip("-")
+    sort_asc, sort_desc = SORT_CHOICES.get(sort_key, SORT_CHOICES["name"])
     reverse = sort_param.startswith("-")
     fits = list(fits.order_by(sort_desc if reverse else sort_asc))
 
@@ -170,7 +175,14 @@ def index(request):
             {"fit": fit, "bottleneck_names": names, "bottleneck_extra": max(0, len(names) - BOTTLENECK_DISPLAY_LIMIT)}
         )
 
-    # Сводная панель: сумма докупки только по фита в статусе DEFICIT (§14).
+    # Сводная панель: в первую очередь корабли в контрактах (§6.12), затем докупка рынка (§14).
+    contracts_deficit_fits_count = sum(1 for fit in fits if fit.contracts_status_cache == ContractFitStatus.DEFICIT)
+    contracts_missing_ships_total = sum(
+        max(0, fit.qty_target - (fit.contracts_available or 0))
+        for fit in fits
+        if fit.contracts_status_cache == ContractFitStatus.DEFICIT
+    )
+    contracts_no_data_count = sum(1 for fit in fits if fit.contracts_status_cache == ContractFitStatus.NO_DATA)
     total_to_buy = sum(
         (fit.total_cost for fit in fits if fit.status_cache == FitStatus.DEFICIT and fit.total_cost), Decimal("0")
     )
@@ -203,13 +215,18 @@ def index(request):
         "rows": rows,
         "fit_count": len(rows),
         "status_filter": status_filter,
+        "contracts_status_filter": contracts_status_filter,
         "scope_filter": scope_filter,
         "bottleneck_filter": bottleneck_filter,
         "sort_param": sort_param,
         "status_choices": FitStatus.values,
+        "contracts_status_choices": ContractFitStatus.values,
         "scope_choices": scope_choice_data,
         "bottleneck_choices": bottleneck_choices,
         "sort_choices": SORT_CHOICES.keys(),
+        "contracts_deficit_fits_count": contracts_deficit_fits_count,
+        "contracts_missing_ships_total": contracts_missing_ships_total,
+        "contracts_no_data_count": contracts_no_data_count,
         "total_to_buy": total_to_buy,
         "no_data_count": no_data_count,
         "hull_missing_count": hull_missing_count,

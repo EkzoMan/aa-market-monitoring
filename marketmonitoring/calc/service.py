@@ -13,9 +13,11 @@ from django.apps import apps
 from django.db.models import Q
 from django.utils import timezone
 
-from ..constants import FitStatus, LocationKind, ScopeKind, SyncStatus
+from ..constants import ContractFitStatus, FitStatus, LocationKind, ScopeKind, SyncStatus
 from ..models import (
     ComponentRequest,
+    ContractCache,
+    ContractProvider,
     Fit,
     JitaOrderLevel,
     MarketLocation,
@@ -23,7 +25,14 @@ from ..models import (
     StockLevel,
 )
 from . import engine
-from .engine import ComponentCalcResult, ComponentInput, OrderBookRow
+from .engine import (
+    ComponentCalcResult,
+    ComponentInput,
+    ContractInput,
+    ContractItemInput,
+    ContractsFitCalcResult,
+    OrderBookRow,
+)
 
 logger = logging.getLogger("marketmonitoring")
 
@@ -45,6 +54,10 @@ class FitCalcResult:
         overprice_count: int | None,
         components: list[ComponentCalcResult],
         reasons: list[str] | None = None,
+        contracts_status: str = ContractFitStatus.NO_DATA,
+        contracts_available: int | None = None,
+        contracts_deficit: int | None = None,
+        contracts_reasons: list[str] | None = None,
     ):
         self.status = status
         self.k = k
@@ -52,6 +65,10 @@ class FitCalcResult:
         self.overprice_count = overprice_count
         self.components = components
         self.reasons = reasons or []
+        self.contracts_status = contracts_status
+        self.contracts_available = contracts_available
+        self.contracts_deficit = contracts_deficit
+        self.contracts_reasons = contracts_reasons or []
 
 
 # ---------------------------------------------------------------------------
@@ -195,6 +212,106 @@ def check_freshness(location_ids: set[int], stale_after_min: int) -> tuple[bool,
     return (len(reasons) == 0, reasons)
 
 
+def check_contracts_freshness(stale_after_min: int) -> tuple[bool, list[str]]:
+    """Проверка свежести кэша контрактов (§6.12).
+
+    Свежими данные считаются, если есть хотя бы один включённый ContractProvider
+    с ``sync_status=ok`` и ``last_synced_at`` не старше ``stale_after_min``.
+    """
+    providers = list(ContractProvider.objects.filter(enabled=True).order_by("priority", "pk"))
+    if not providers:
+        return False, ["no enabled contract providers"]
+    stale_cutoff = timezone.now() - timedelta(minutes=stale_after_min)
+    provider_reasons: list[str] = []
+    any_fresh_ok = False
+    for provider in providers:
+        if provider.sync_status != SyncStatus.OK:
+            provider_reasons.append(
+                f"contract provider {provider.character_id} ({provider.source_kind}): sync_status={provider.sync_status}"
+            )
+            continue
+        if provider.last_synced_at is None or provider.last_synced_at < stale_cutoff:
+            provider_reasons.append(f"contract provider {provider.character_id} ({provider.source_kind}): stale")
+            continue
+        any_fresh_ok = True
+    if any_fresh_ok:
+        return True, []
+    return False, provider_reasons
+
+
+def evaluate_fit_contracts(
+    fit: Fit,
+    settings_obj: PluginSetting | None = None,
+    scope_cache: dict[tuple[str, int], set[int]] | None = None,
+) -> tuple[ContractsFitCalcResult, list[tuple[ContractCache, int]], list[str]]:
+    """Оценка достаточности готовых кораблей в фите по открытым контрактам (§6.12).
+
+    Читает только кэш БД плагина (ContractCache + prefetch items, без N+1 и без ESI)
+    и вызывает чистую функцию ``engine.calc_contracts_fit``. Возвращает
+    ``(результат_ядра, [(ContractCache, ships_count), ...], причины_NO_DATA)``.
+    """
+    if settings_obj is None:
+        settings_obj = PluginSetting.load()
+    required_components = list(fit.components.all().order_by("pk").values_list("type_id", "qty_per_fit"))
+    if not required_components:
+        empty_res = engine.calc_contracts_fit([], [], fit.qty_target, has_no_data=True)
+        return empty_res, [], ["fit has no components"]
+
+    fresh, contract_reasons = check_contracts_freshness(settings_obj.data_stale_after_min)
+    if not fresh:
+        no_data_res = engine.calc_contracts_fit([], required_components, fit.qty_target, has_no_data=True)
+        return no_data_res, [], contract_reasons
+
+    if scope_cache is not None:
+        location_ids = _resolve_scope_cached(scope_cache, fit.scope_kind, fit.scope_ref)
+    else:
+        location_ids = resolve_scope_ids(fit.scope_kind, fit.scope_ref)
+
+    if not location_ids:
+        no_scope_res = engine.calc_contracts_fit([], required_components, fit.qty_target, has_no_data=True)
+        return no_scope_res, [], [f"scope {fit.scope_kind}/{fit.scope_ref}: no locations resolved"]
+
+    now = timezone.now()
+    contracts_list = list(
+        ContractCache.objects.filter(
+            status="outstanding",
+            contract_type="item_exchange",
+            date_expired__gt=now,
+            start_location_id__in=location_ids,
+        )
+        .prefetch_related("items")
+        .order_by("date_expired", "contract_id")
+    )
+    contract_by_id = {c.contract_id: c for c in contracts_list}
+    contract_inputs = [
+        ContractInput(
+            contract_id=c.contract_id,
+            items=[
+                ContractItemInput(
+                    type_id=item.type_id,
+                    quantity=int(item.quantity),
+                    is_included=item.is_included,
+                    raw_quantity=item.raw_quantity,
+                )
+                for item in c.items.all()
+            ],
+        )
+        for c in contracts_list
+    ]
+    calc_res = engine.calc_contracts_fit(
+        contracts=contract_inputs,
+        required_components=required_components,
+        qty_target=fit.qty_target,
+        has_no_data=False,
+    )
+    matched_rows = [
+        (contract_by_id[m.contract_id], m.ships_count)
+        for m in calc_res.matched_contracts
+        if m.contract_id in contract_by_id
+    ]
+    return calc_res, matched_rows, []
+
+
 # ---------------------------------------------------------------------------
 # Доступность (§6.2)
 # ---------------------------------------------------------------------------
@@ -330,32 +447,67 @@ def _save_fit_cache(
     k: int | None,
     total_cost: Decimal | None,
     overprice_count: int | None,
+    contracts_status: str = ContractFitStatus.NO_DATA,
+    contracts_available: int | None = None,
 ) -> None:
-    """Запись кэша расчёта в Fit (status_cache, fits_available, total_cost, last_checked_at)."""
+    """Запись кэша расчёта в Fit (контракты + рынок + last_checked_at)."""
     fit.status_cache = status
     fit.fits_available = k
     fit.total_cost = total_cost
     fit.overprice_count = overprice_count
+    fit.contracts_status_cache = contracts_status
+    fit.contracts_available = contracts_available
     fit.last_checked_at = timezone.now()
-    fit.save(update_fields=["status_cache", "fits_available", "total_cost", "overprice_count", "last_checked_at"])
+    fit.save(
+        update_fields=[
+            "status_cache",
+            "fits_available",
+            "total_cost",
+            "overprice_count",
+            "contracts_status_cache",
+            "contracts_available",
+            "last_checked_at",
+        ]
+    )
 
 
 def recalc_fit(fit: Fit) -> FitCalcResult:
-    """Пересчёт одного фита (§6) и запись кэша статуса в Fit (§12.1).
+    """Пересчёт одного фита (§6, §6.12) и запись кэша статуса в Fit (§12.1).
 
-    Нужные локации — объединение областей всех компонентов с учётом override;
+    В первую очередь оценивается достаточность готовых кораблей в открытых
+    контрактах (§6.12), затем рыночная собираемость компонентов (§6.1–§6.9).
+    Нужные локации рынка — объединение областей всех компонентов с учётом override;
     при NO_DATA (§6.7) дефицит и стоимость не рассчитываются (§6.4). Дефицит —
-    независимо по каждому фиту (§5.5). Причины NO_DATA возвращаются в
-    FitCalcResult.reasons и НЕ сохраняются в модель — в §8 поля для них нет,
-    расширять модели запрещено; UI получит их из результата пересчёта (этап 5).
+    независимо по каждому фиту (§5.5).
     """
     settings_obj = PluginSetting.load()
     scope_cache: dict[tuple[str, int], set[int]] = {}
+    contracts_res, _matched_contracts, contracts_reasons = evaluate_fit_contracts(
+        fit, settings_obj=settings_obj, scope_cache=scope_cache
+    )
     component_rows_data, all_components_have_data = _component_inputs(fit, scope_cache)
     component_rows = component_rows_data
     if not component_rows:
-        _save_fit_cache(fit, FitStatus.NO_DATA, None, None, None)
-        return FitCalcResult(FitStatus.NO_DATA, None, None, None, [])
+        _save_fit_cache(
+            fit,
+            FitStatus.NO_DATA,
+            None,
+            None,
+            None,
+            contracts_status=contracts_res.status,
+            contracts_available=contracts_res.ships_available,
+        )
+        return FitCalcResult(
+            FitStatus.NO_DATA,
+            None,
+            None,
+            None,
+            [],
+            contracts_status=contracts_res.status,
+            contracts_available=contracts_res.ships_available,
+            contracts_deficit=contracts_res.deficit,
+            contracts_reasons=contracts_reasons,
+        )
 
     # Нужные локации — объединение областей всех компонентов (в т.ч. override);
     # резолв области кешируется на время пересчёта фита.
@@ -377,8 +529,27 @@ def recalc_fit(fit: Fit) -> FitCalcResult:
         # NO_DATA: локация не свежа (§6.7) или агрегат StockLevel отсутствует
         # по нужной локации (§6.7); дефицит и стоимость не считаются (§6.4).
         status = engine.STATUS_NO_DATA
-        _save_fit_cache(fit, status, None, None, None)
-        return FitCalcResult(status, None, None, None, [], reasons)
+        _save_fit_cache(
+            fit,
+            status,
+            None,
+            None,
+            None,
+            contracts_status=contracts_res.status,
+            contracts_available=contracts_res.ships_available,
+        )
+        return FitCalcResult(
+            status,
+            None,
+            None,
+            None,
+            [],
+            reasons,
+            contracts_status=contracts_res.status,
+            contracts_available=contracts_res.ships_available,
+            contracts_deficit=contracts_res.deficit,
+            contracts_reasons=contracts_reasons,
+        )
 
     # Стаканы и ref по каждому типу — из кэша JitaOrderLevel, без ESI (§5.10);
     # один запрос на все type_id (без N+1, §22.4).
@@ -414,9 +585,36 @@ def recalc_fit(fit: Fit) -> FitCalcResult:
     status = engine.calc_fit_status(False, hull_available_calc, k, fit.qty_target, allow_hull_missing=True)
     total_cost = sum((r.cost for r in results), Decimal("0"))
     overprice_count = sum(1 for r in results if r.is_overprice)
-    _save_fit_cache(fit, status, k, total_cost, overprice_count)
-    logger.debug("Fit %s recalculated: status=%s K=%s total=%s", fit.pk, status, k, total_cost)
-    return FitCalcResult(status, k, total_cost, overprice_count, results, reasons)
+    _save_fit_cache(
+        fit,
+        status,
+        k,
+        total_cost,
+        overprice_count,
+        contracts_status=contracts_res.status,
+        contracts_available=contracts_res.ships_available,
+    )
+    logger.debug(
+        "Fit %s recalculated: contracts=%s(%s) market=%s(%s) total=%s",
+        fit.pk,
+        contracts_res.status,
+        contracts_res.ships_available,
+        status,
+        k,
+        total_cost,
+    )
+    return FitCalcResult(
+        status,
+        k,
+        total_cost,
+        overprice_count,
+        results,
+        reasons,
+        contracts_status=contracts_res.status,
+        contracts_available=contracts_res.ships_available,
+        contracts_deficit=contracts_res.deficit,
+        contracts_reasons=contracts_reasons,
+    )
 
 
 def recalc_component_request(request: ComponentRequest) -> FitCalcResult:

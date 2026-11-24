@@ -13,6 +13,7 @@ ADMIN_URLS = [
     "admin:marketmonitoring_notificationlog_changelist",
     "admin:marketmonitoring_marketlocation_changelist",
     "admin:marketmonitoring_structureprovider_changelist",
+    "admin:marketmonitoring_contractprovider_changelist",
     "admin:marketmonitoring_webhookconfig_changelist",
     "admin:marketmonitoring_pluginsetting_changelist",
 ]

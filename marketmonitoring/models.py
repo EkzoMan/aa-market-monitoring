@@ -6,6 +6,8 @@ from django.db import models
 from django.utils.translation import gettext_lazy as _
 
 from .constants import (
+    ContractFitStatus,
+    ContractSourceKind,
     DisplayLanguageMode,
     FitStatus,
     LocationKind,
@@ -92,6 +94,10 @@ class Fit(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     last_checked_at = models.DateTimeField(null=True, blank=True)
+    contracts_status_cache = models.CharField(
+        max_length=16, choices=ContractFitStatus.choices, default=ContractFitStatus.NO_DATA, db_index=True
+    )
+    contracts_available = models.IntegerField(null=True, blank=True)  # C — комплектов кораблей в контрактах (§6.12)
 
     class Meta:
         verbose_name = _("Fit")
@@ -102,6 +108,90 @@ class Fit(models.Model):
 
     def __str__(self) -> str:
         return self.name
+
+
+class ContractProvider(models.Model):
+    """Провайдер контрактов ESI: персонаж AA со скоупом чтения корп./перс. контрактов (§8, §9.1)."""
+
+    character = models.ForeignKey(
+        "eveonline.EveCharacter",
+        on_delete=models.PROTECT,
+        related_name="marketmonitoring_contract_providers",
+    )
+    source_kind = models.CharField(
+        max_length=16, choices=ContractSourceKind.choices, default=ContractSourceKind.CORPORATION
+    )
+    priority = models.PositiveSmallIntegerField(default=100)  # меньше = выше приоритет
+    enabled = models.BooleanField(default=True)
+    status = models.CharField(max_length=16, choices=ProviderStatus.choices, default=ProviderStatus.OK)
+    sync_status = models.CharField(max_length=16, choices=SyncStatus.choices, default=SyncStatus.STALE)
+    acl_fail_count = models.PositiveSmallIntegerField(default=0)
+    cooldown_until = models.DateTimeField(null=True, blank=True)
+    last_synced_at = models.DateTimeField(null=True, blank=True)
+    note = models.CharField(max_length=255, blank=True, default="")
+
+    class Meta:
+        verbose_name = _("Contract provider")
+        verbose_name_plural = _("Contract providers")
+        constraints = [
+            models.UniqueConstraint(fields=["character", "source_kind"], name="unique_contractprovider_char_kind"),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.character} ({self.source_kind}, prio {self.priority})"
+
+
+class ContractCache(models.Model):
+    """Кэш открытых item_exchange контрактов ESI (§6.12, §8); дедупликация по уникальному contract_id."""
+
+    contract_id = models.BigIntegerField(unique=True, db_index=True)
+    source_kind = models.CharField(max_length=16, choices=ContractSourceKind.choices)
+    source_ref = models.BigIntegerField()  # corporation_id или character_id
+    issuer_id = models.BigIntegerField()
+    issuer_corporation_id = models.BigIntegerField()
+    assignee_id = models.BigIntegerField()
+    availability = models.CharField(max_length=32)
+    contract_type = models.CharField(max_length=32)
+    status = models.CharField(max_length=32)
+    title = models.CharField(max_length=255, blank=True, default="")
+    start_location_id = models.BigIntegerField(db_index=True)
+    price = models.DecimalField(max_digits=DECIMAL_MAX_DIGITS, decimal_places=DECIMAL_PLACES, default=0)
+    date_issued = models.DateTimeField()
+    date_expired = models.DateTimeField()
+    fetched_at = models.DateTimeField()
+
+    class Meta:
+        verbose_name = _("Contract cache")
+        verbose_name_plural = _("Contract cache")
+        indexes = [
+            models.Index(fields=["source_kind", "source_ref"], name="contractcache_source_idx"),
+            models.Index(fields=["start_location_id", "status"], name="contractcache_loc_status_idx"),
+        ]
+
+    def __str__(self) -> str:
+        return f"contract {self.contract_id} ({self.availability})"
+
+
+class ContractItemCache(models.Model):
+    """Позиции кэшированного контракта ESI (§6.12, §8)."""
+
+    contract = models.ForeignKey(ContractCache, on_delete=models.CASCADE, related_name="items")
+    record_id = models.BigIntegerField()
+    type_id = models.IntegerField(db_index=True)
+    quantity = models.BigIntegerField()
+    is_included = models.BooleanField(default=True)
+    is_singleton = models.BooleanField(default=False)
+    raw_quantity = models.IntegerField(null=True, blank=True)
+
+    class Meta:
+        verbose_name = _("Contract item cache")
+        verbose_name_plural = _("Contract item cache")
+        indexes = [
+            models.Index(fields=["contract", "type_id"], name="contractitem_contract_type_idx"),
+        ]
+
+    def __str__(self) -> str:
+        return f"contract {self.contract_id} type {self.type_id} x{self.quantity}"
 
 
 class FitComponent(models.Model):
@@ -332,6 +422,10 @@ class PluginSetting(models.Model):
         choices=DisplayLanguageMode.choices,
         default=DisplayLanguageMode.CLIENT_DEFAULT,
     )
+    contracts_sync_interval_min = models.IntegerField(
+        default=30, validators=[MinValueValidator(5), MaxValueValidator(1440)], help_text=_("5..1440")
+    )
+    notification_contracts_deficit_enabled = models.BooleanField(default=True)
 
     class Meta:
         verbose_name = _("Plugin setting")

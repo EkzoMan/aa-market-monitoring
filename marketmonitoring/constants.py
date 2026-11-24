@@ -38,6 +38,21 @@ class FitStatus(models.TextChoices):
     NO_DATA = "no_data", _("NO_DATA")
 
 
+class ContractFitStatus(models.TextChoices):
+    """Статус обеспеченности фита кораблями в контрактах (§6.12, §8 Fit.contracts_status_cache)."""
+
+    OK = "ok", _("OK")
+    DEFICIT = "deficit", _("DEFICIT")
+    NO_DATA = "no_data", _("NO_DATA")
+
+
+class ContractSourceKind(models.TextChoices):
+    """Вид источника контрактов ESI (§8 ContractProvider.source_kind, ContractCache.source_kind)."""
+
+    CORPORATION = "corporation", _("corporation")
+    CHARACTER = "character", _("character")
+
+
 class ProviderStatus(models.TextChoices):
     """Статус провайдера структур (§8 StructureProvider.status, §11)."""
 
@@ -73,6 +88,7 @@ class NotificationEvent(models.TextChoices):
     """События уведомлений Discord (§13)."""
 
     DEFICIT = "deficit", _("deficit")
+    CONTRACTS_DEFICIT = "contracts_deficit", _("contracts_deficit")
     HULL_MISSING = "hull_missing", _("hull_missing")
     PROVIDER_ACL_LOST = "provider_acl_lost", _("provider_acl_lost")
     SYNC_FAILED = "sync_failed", _("sync_failed")

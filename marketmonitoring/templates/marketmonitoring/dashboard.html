@@ -30,6 +30,25 @@
     <div class="card card-primary h-100">
       <div class="card-header"><h3 class="card-title">{% translate "Summary" %}</h3></div>
       <div class="card-body">
+        <div class="mb-2 pb-2 border-bottom">
+          <div class="d-flex align-items-baseline gap-2">
+            <span class="h4 mm-num mb-0">{{ contracts_missing_ships_total }}</span>
+            <span class="text-body-secondary small">{% translate "ships missing on contracts" %}</span>
+          </div>
+          <div class="small">
+            {% if contracts_deficit_fits_count %}
+            <a href="?contracts_status=deficit" class="text-warning">
+              {% blocktranslate count counter=contracts_deficit_fits_count %}{{ counter }} fit with contract deficit{% plural %}{{ counter }} fits with contract deficit{% endblocktranslate %}
+            </a>
+            {% elif contracts_no_data_count %}
+            <a href="?contracts_status=no_data" class="text-body-secondary">
+              {% blocktranslate count counter=contracts_no_data_count %}{{ counter }} fit without contract data{% plural %}{{ counter }} fits without contract data{% endblocktranslate %}
+            </a>
+            {% else %}
+            <span class="text-success">{% translate "All tracked fits covered on contracts." %}</span>
+            {% endif %}
+          </div>
+        </div>
         <div class="h3 mm-num mb-1">{{ total_to_buy|isk }} <small class="text-body-secondary">ISK</small></div>
         <div class="text-body-secondary small mb-2">{% translate "Total to buy" %}</div>
         {% if no_data_count %}
@@ -62,6 +81,15 @@
       <div class="card-header"><h3 class="card-title">{% translate "Filters" %}</h3></div>
       <div class="card-body">
         <form method="get" class="row g-2 align-items-end">
+          <div class="col-6 col-md-auto">
+            <label class="form-label small mb-1" for="mm-f-contracts-status">{% translate "Contracts" %}</label>
+            <select name="contracts_status" id="mm-f-contracts-status" class="form-select form-select-sm">
+              <option value="">{% translate "All contracts" %}</option>
+              {% for cst in contracts_status_choices %}
+              <option value="{{ cst }}" {% if cst == contracts_status_filter %}selected{% endif %}>{{ cst|upper }}</option>
+              {% endfor %}
+            </select>
+          </div>
           <div class="col-6 col-md-auto">
             <label class="form-label small mb-1" for="mm-f-status">{% translate "Status" %}</label>
             <select name="status" id="mm-f-status" class="form-select form-select-sm">
@@ -123,6 +151,8 @@
       <thead>
         <tr>
           <th>{% translate "Fit" %}</th>
+          <th>{% translate "Ships on contracts" %}</th>
+          <th>{% translate "Contracts status" %}</th>
           <th>{% translate "Collectability" %}</th>
           <th>{% translate "Status" %}</th>
           <th class="text-end">{% translate "Total to buy" %}</th>
@@ -135,6 +165,18 @@
         {% for row in rows %}
         <tr>
           <td class="mm-nowrap"><a href="{% url 'marketmonitoring:fit_detail' row.fit.pk %}">{{ row.fit.name }}</a></td>
+          <td>
+            {% if row.fit.contracts_status_cache == 'ok' or row.fit.contracts_status_cache == 'deficit' %}
+            <span class="mm-num fw-semibold">{{ row.fit.contracts_available }} <span class="text-body-secondary">{% translate "of" %} {{ row.fit.qty_target }}</span></span>
+            <div class="progress mm-progress mt-1">
+              <div class="progress-bar bg-{{ row.fit.contracts_status_cache|status_class }}"
+                   style="width: {% widthratio row.fit.contracts_available row.fit.qty_target 100 %}%"></div>
+            </div>
+            {% else %}
+            &mdash;
+            {% endif %}
+          </td>
+          <td><span class="badge text-bg-{{ row.fit.contracts_status_cache|status_class }}">{{ row.fit.get_contracts_status_cache_display }}</span></td>
           <td>
             {% if row.fit.status_cache == 'ok' or row.fit.status_cache == 'deficit' %}
             <span class="mm-num fw-semibold">{{ row.fit.fits_available }} <span class="text-body-secondary">{% translate "of" %} {{ row.fit.qty_target }}</span></span>

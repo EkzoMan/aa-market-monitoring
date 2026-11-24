@@ -3,6 +3,7 @@
 from django.contrib import admin
 
 from .models import (
+    ContractProvider,
     MarketLocation,
     NotificationLog,
     PluginSetting,
@@ -101,6 +102,24 @@ class StructureProviderAdmin(SuperuserOnlyAdmin):
         "last_verified_at",
     )
     list_filter = ("enabled", "status")
+
+
+@admin.register(ContractProvider)
+class ContractProviderAdmin(SuperuserOnlyAdmin):
+    """Провайдеры контрактов — только для суперпользователя (§3)."""
+
+    list_display = (
+        "character",
+        "source_kind",
+        "priority",
+        "enabled",
+        "status",
+        "sync_status",
+        "acl_fail_count",
+        "cooldown_until",
+        "last_synced_at",
+    )
+    list_filter = ("source_kind", "enabled", "status", "sync_status")
 
 
 @admin.register(WebhookConfig)

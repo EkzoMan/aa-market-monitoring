@@ -1,4 +1,4 @@
-# ТЗ: `aa-market-monitoring` v1.1
+# ТЗ: `aa-market-monitoring` v1.2
 
 **Статус:** финальная версия, готова к реализации
 **Платформа:** Alliance Auth 5.x, Django 4.2, Python 3.11, PostgreSQL 15+, Redis (Celery)
@@ -9,19 +9,20 @@
 
 ## 1. Назначение и границы
 
-Плагин мониторит доступность компонентов и фитов на заданных рынках (станции/структуры/системы/регионы), считает, сколько фитов реально можно собрать «прямо сейчас», и рассчитывает стоимость докупки недостающего в Jita с наценкой и доставкой.
+Плагин в первую очередь контролирует наличие готовых кораблей в фите в открытых контрактах (корпоративных, альянсовых и персональных), а также мониторит доступность отдельных компонентов на заданных рынках (станции/структуры/системы/регионы), считает, сколько фитов реально можно собрать «прямо сейчас», и рассчитывает стоимость докупки недостающего в Jita с наценкой и доставкой.
 
-**Решаемая проблема:** обеспечение рынка алли форматами и компонентами ведётся вручную; нет сводной картины «чего не хватает, где, сколько стоит довезти».
+**Решаемая проблема:** обеспечение контрактов и рынка алли готовыми кораблями в доктринных фитах и компонентами ведётся вручную; нет сводной картины «хватает ли выставленных в контракты кораблей, чего не хватает на рынке, где и сколько стоит довезти».
 
 ### 1.1 Входит в объём
 
+- Мониторинг открытых `item_exchange` контрактов (корпоративных, альянсовых и персональных) через ESI и проверка достаточности полных комплектов кораблей по каждому фиту ($C$ из $N$).
 - Справочник локаций мониторинга (из SDE), вкл/выкл.
 - Фиты: вставка EFT-текста из игры, предпросмотр разбора, ручная правка состава, целевое количество $N$, область доступности, per-component override.
 - Отдельные компоненты вне фитов: тип, целевое количество, область.
-- Кэширование рыночных данных ESI в таблицах плагина; UI читает только БД.
-- Расчёт собираемости $K$, дефицита $D_i$, цены покрытия по стакану Jita, стоимости докупки, флага `OVERPRICE`.
+- Кэширование данных контрактов и рыночных данных ESI в таблицах плагина; UI читает только БД.
+- Расчёт комплектности контрактов $C$, рыночной собираемости $K$, дефицита $D_i$, цены покрытия по стакану Jita, стоимости докупки, флага `OVERPRICE`.
 - Фоновые задачи Celery + ручной запуск обновления из UI.
-- Discord webhook (один канал): дефицит, отсутствие корпуса, ACL/провайдеры, сбой и восстановление синка.
+- Discord webhook (один канал): дефицит кораблей в контрактах, рыночный дефицит компонентов, отсутствие корпуса, ACL/провайдеры, сбой и восстановление синка.
 - Экспорт списка закупки: буфер обмена (multibuy), `.txt`, `.csv`.
 - Роли `market_monitoring_view` / `market_monitoring_edit`.
 - i18n-каркас (этап 1 — английские названия типов).
@@ -29,7 +30,7 @@
 ### 1.2 **Не входит в объём** (не реализовывать)
 
 - Производство/промышленность, ME/TE, BPC, планы сборки.
-- Размещение заказов, контракты, торговые операции.
+- Размещение заказов, создание/принятие контрактов, торговые операции.
 - История цен и графики (хранится только текущий срез).
 - Приватные фиты; всё общее для роли.
 - Аудит-журнал изменений (кто что правил).
@@ -68,7 +69,7 @@
 | Управление локациями | — | ✅ | ✅ |
 | Ручной запуск обновления данных | — | ✅ | ✅ |
 | Настройки плагина (наценка, пороги, интервалы, webhook) | — | ✅ | ✅ |
-| Привязка/отзыв/включение `StructureProvider` | — | ✅ | ✅ |
+| Привязка/отзыв/включение `StructureProvider` и `ContractProvider` | — | ✅ | ✅ |
 | Просмотр лога синков (`SyncRun`) | — | — | ✅ (только `/admin/`) |
 
 Проверка прав — хелпер `has_view(user)` / `has_edit(user)` (суперпользователь или членство в группе). Пункт меню виден при `has_view`.
@@ -95,6 +96,8 @@
 | FR-14 | Кэш ESI в БД, перезапись по срезу, автоочистка данных отключённых локаций |
 | FR-15 | Провайдеры структур 2–4: приоритет, cooldown 60 мин при ACL-сбое, отключение после 3 сбоев подряд |
 | FR-16 | i18n-каркас: UI-строки через gettext; имена типов по `LANGUAGE_CODE`, этап 1 — `en` |
+| FR-17 | Провайдеры контрактов (`ContractProvider`: корпоративные/альянсовые и персональные контракты ESI) и фоновый синк открытых `item_exchange` контрактов с позициями |
+| FR-18 | Приоритетная проверка достаточности полных комплектов кораблей в фите по открытым контрактам ($C$ из $N$), отображение в UI и Discord-событие `contracts_deficit` |
 
 ---
 
@@ -265,6 +268,27 @@ $$
 
 `ref` корпуса $=40\,000\,000$; порог $\tau=25\%$ → $50\,000\,000$; `unit` $41\,500\,000$ → оверпрайса нет.
 
+### 6.12 Комплектность кораблей в контрактах
+
+Для фита с составом $\{(t_i, q_i)\}_{i=1..m}$ (корпус + все модули, риги, дроны и заряды) и областью фита $S_{\text{fit}}$ проверяются кэшированные контракты со статусом `outstanding`, типом `item_exchange`, не истёкшим сроком (`date_expired > now`) и локацией выдачи `start_location_id` $\in L(S_{\text{fit}})$. Дедупликация выполняется по уникальному `contract_id` (контракт, полученный сразу через корпоративный и персональный эндпоинты, учитывается один раз).
+
+Для каждого подходящего контракта $c$ по позициям с `is_included = true` и `raw_quantity != -2` (исключая BPC) суммируется количество каждого типа $Q_c(t)$. Число полных комплектов корабля в фите внутри контракта $c$:
+
+$$
+\text{ships}_c = \min_{i=1..m} \left\lfloor \frac{Q_c(t_i)}{q_i} \right\rfloor
+$$
+
+Если хотя бы одной позиции фита в контракте не хватает ($Q_c(t_i) < q_i$), $\text{ships}_c = 0$. Итоговое число кораблей в фите на контрактах и дефицит контрактов:
+
+$$
+C = \sum_{c} \text{ships}_c, \qquad D_{\text{contracts}} = \max(0,\; N - C)
+$$
+
+Статус контрактов фита (`contracts_status_cache`):
+- `no_data` — нет включённых `ContractProvider`, либо ни один включённый провайдер не имеет свежего успешного синка (`sync_status = ok`, `last_synced_at >= now - data_stale_after_min`);
+- `deficit` — данные свежие и $C < N$;
+- `ok` — данные свежие и $C \ge N$.
+
 ---
 
 ## 7. EFT-парсер
@@ -375,6 +399,47 @@ Fit
     created_by          FK -> AUTH_USER_MODEL (SET_NULL, null)
     created_at / updated_at
     last_checked_at     DateTime null     # для UI «последняя проверка»
+    contracts_status_cache CharField(choices: ok|deficit|no_data) default no_data
+    contracts_available Integer null      # C — полных комплектов кораблей в контрактах
+
+ContractProvider
+    character           FK -> eveonline.Character (on_delete=PROTECT)
+    source_kind         CharField(choices: corporation|character) default corporation
+    priority            PositiveSmallInteger default 100
+    enabled             Boolean default True
+    status              CharField(choices: ok|cooling_down|disabled) default ok
+    sync_status         CharField(choices: ok|no_acl|error|no_provider|stale) default stale
+    acl_fail_count      PositiveSmallInteger default 0
+    cooldown_until      DateTime null
+    last_synced_at      DateTime null
+    note                CharField(255, blank)
+    UNIQUE (character, source_kind)
+
+ContractCache
+    contract_id         BigInteger unique
+    source_kind         CharField(corporation|character)
+    source_ref          BigInteger      # corporation_id или character_id
+    issuer_id           BigInteger
+    issuer_corporation_id BigInteger
+    assignee_id         BigInteger
+    availability        CharField(32)   # corporation|alliance|personal|public
+    contract_type       CharField(32)   # item_exchange
+    status              CharField(32)   # outstanding
+    title               CharField(255, blank)
+    start_location_id   BigInteger
+    price               Decimal
+    date_issued         DateTime
+    date_expired        DateTime
+    fetched_at          DateTime
+
+ContractItemCache
+    contract            FK -> ContractCache (CASCADE, related_name='items')
+    record_id           BigInteger
+    type_id             Integer
+    quantity            BigInteger
+    is_included         Boolean default True
+    is_singleton        Boolean default False
+    raw_quantity        Integer null
 
 FitComponent
     fit                 FK -> Fit (CASCADE, related_name='components')
@@ -469,6 +534,8 @@ PluginSetting                           # singleton
 | Заказы региона | `Market.get_region_orders(region_id, order_type='sell', page=N)` | нет |
 | Заказы структуры | `Market.get_structure_orders(structure_id, order_type='sell', page=N)` | провайдер, скоуп `esi-markets.structure_markets.v1` |
 | Инфо о структуре | `Universe.get_universe_structures_structure_id` | провайдер, `esi-universe.read_structures.v1` |
+| Контракты корпорации (+ альянса) | `Contracts.GetCorporationsCorporationIdContracts` + `...Items` | провайдер контрактов, `esi-contracts.read_corporation_contracts.v1` |
+| Контракты персонажа | `Contracts.GetCharactersCharacterIdContracts` + `...Items` | провайдер контрактов, `esi-contracts.read_character_contracts.v1` |
 
 Скоупы провайдера проверяются при привязке: `esi-markets.structure_markets.v1`, `esi-universe.read_structures.v1`. Если у персонажа скоупов нет — отказ в привязке с текстом «добавьте персонажа с нужными скоупами».
 
@@ -543,6 +610,8 @@ PluginSetting                           # singleton
 | `notification_deficit_cooldown_min` | Integer | 120 | 1…1440 |
 | `webhook_url` | URL | — | один канал |
 | `display_language_mode` | Enum | `client_default` | `client_default` \| `fixed_en` |
+| `contracts_sync_interval_min` | Integer | 30 | 5…1440 |
+| `notification_contracts_deficit_enabled` | Boolean | True | — |
 
 Изменение интервалов не требует перезапуска beat: beat дёргает задачи часто, задача сама проверяет, истёк ли интервал (§12).
 
@@ -576,6 +645,7 @@ PluginSetting                           # singleton
 | `sync_jita_book` | снимок стакана Jita по типам расчёта | `jita_sync_interval_min` |
 | `sync_region_orders` | заказы нужных регионов | `stock_sync_interval_min` |
 | `sync_structure_orders` | заказы включённых структур | `stock_sync_interval_min` |
+| `sync_contracts` | открытые контракты корпораций/персонажей и их позиции | `contracts_sync_interval_min` |
 | `recalc_stock_levels` | агрегация кэша → `StockLevel` + пересчёт фитов/компонентов | после синков |
 | `cleanup_orphan_cache` | удаление кэша отключённых/удалённых локаций | 24 ч |
 | `verify_providers` | валидация провайдеров | 60 мин |
@@ -612,6 +682,7 @@ Beat дёргает `sync_jita_book`, `sync_region_orders`, `sync_structure_orde
 | Событие | Когда | Содержимое |
 |---|---|---|
 | `deficit` | beat-проверка, $K<N$ | фит, $K/N$, до 5 узких мест, сумма докупки, число оверпрайс-позиций, ссылка |
+| `contracts_deficit` | beat-проверка, $C<N$ | фит, $C/N$ кораблей в контрактах, нехватка $N-C$, область, ссылка |
 | `hull_missing` | корпус отсутствует в области | фит, область, ссылка |
 | `provider_acl_lost` | ACL-сбой / отключение провайдера | персонаж, локация, `acl_fail_count`, статус |
 | `sync_failed` | задача упала / превышен порог ошибок | задача, число ошибок, краткий текст |
@@ -841,6 +912,12 @@ profile = "black"
 | 28 | Округление: количества целые, ISK до целого; расчёты в `Decimal` |
 | 29 | История цен не хранится; `order_range` при агрегации не используется |
 | 30 | Платформа: AA 5.x, Django 4.2, Python 3.11, PostgreSQL 15+ |
+| 31 | Первичная проверка достаточности фита ведётся по открытым (`outstanding`, не истёкшим) `item_exchange` контрактам в области фита |
+| 32 | Источники контрактов ESI: корпоративный (`/corporations/{id}/contracts/`, включая корпоративные и альянсовые контракты) и персональный (`/characters/{id}/contracts/`); дедупликация по `contract_id` |
+| 33 | «Корабль в фите» в контракте — полный комплект всех позиций `FitComponent` (`is_included=true`, кроме BPC `raw_quantity=-2`); в одном контракте может быть $\ge 1$ комплектов ($\min_i \lfloor Q_c(t_i)/q_i \rfloor$) |
+| 34 | Статус и количество кораблей в контрактах (`contracts_status_cache`, `contracts_available`) хранятся в `Fit` отдельно от рыночной собираемости $K$, не изменяя формулы §6.1–§6.11 |
+| 35 | Позиции `items` открытого `item_exchange` контракта неизменны и запрашиваются из ESI один раз при появлении `contract_id` в кэше |
+| 36 | При `trigger=beat` и $C < N$ отправляется Discord-уведомление `contracts_deficit` с дедупликацией по изменению состояния либо кулдауну `notification_deficit_cooldown_min` |
 
 ---
 

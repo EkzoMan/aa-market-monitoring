@@ -6,14 +6,19 @@ UI никогда не обращается к ESI — только Celery-за�
 
 import logging
 import time
+from datetime import datetime
+from datetime import timezone as dt_timezone
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Any, Iterable, Iterator
 
 import requests
 from django.utils import timezone
+from django.utils.dateparse import parse_datetime
 from esi.exceptions import ESIErrorLimitException, HTTPClientError, HTTPServerError
 from esi.models import Token
 from esi.openapi_clients import ESIClientProvider
 
+from ..constants import ContractSourceKind
 from ..models import PluginSetting
 
 logger = logging.getLogger("marketmonitoring")
@@ -27,6 +32,10 @@ PROVIDER_SCOPES = [SCOPE_STRUCTURE_MARKETS, SCOPE_READ_STRUCTURES]
 # персонажа есть права дока (включая структуры его корпорации).
 SCOPE_SEARCH_STRUCTURES = "esi-search.search_structures.v1"
 
+# Скоупы чтения контрактов (§9.1, §6.12): корпоративные (+ альянсовые) и персональные.
+SCOPE_CORP_CONTRACTS = "esi-contracts.read_corporation_contracts.v1"
+SCOPE_CHAR_CONTRACTS = "esi-contracts.read_character_contracts.v1"
+
 # Порог заголовка X-ESI-Error-Limit-Remain (§9.2).
 ERROR_LIMIT_REMAIN_THRESHOLD = 10
 
@@ -39,6 +48,11 @@ ESI_OPERATIONS = [
     "GetMarketsRegionIdOrders",
     "GetMarketsStructuresStructureId",
     "GetUniverseStructuresStructureId",
+    "GetCharactersCharacterIdSearch",
+    "GetCorporationsCorporationIdContracts",
+    "GetCorporationsCorporationIdContractsContractIdItems",
+    "GetCharactersCharacterIdContracts",
+    "GetCharactersCharacterIdContractsContractIdItems",
 ]
 
 # Собственный провайдер django-esi: `esi.client.Market.GetMarketsRegionIdOrders` и т.д.
@@ -372,6 +386,176 @@ def build_order_cache_rows(
                 "price": _order_field(order, "price"),
                 "volume": int(volume or 0),
                 "fetched_at": now,
+            }
+        )
+    return rows
+
+
+def contract_scope_for_kind(source_kind: str) -> str:
+    """Требуемый ESI-скоуп по виду источника контрактов (§9.1)."""
+    if source_kind == ContractSourceKind.CHARACTER:
+        return SCOPE_CHAR_CONTRACTS
+    return SCOPE_CORP_CONTRACTS
+
+
+def get_contract_token(character_id: int | None, source_kind: str) -> Token | None:
+    """Валидный токен из AA по character_id и скоупу контрактов (§9.1); плагин токены не хранит."""
+    scope = contract_scope_for_kind(source_kind)
+    return Token.objects.filter(character_id=character_id).require_scopes(scope).require_valid().order_by("pk").first()
+
+
+def _token_for_contracts(character_id: int, source_kind: str) -> Token:
+    """Токен провайдера контрактов; при отсутствии валидного — ValueError."""
+    scope = contract_scope_for_kind(source_kind)
+    token = get_contract_token(character_id, source_kind)
+    if token is None:
+        raise ValueError(f"No valid AA token with scope {scope} for character {character_id}")
+    return token
+
+
+def fetch_corporation_contracts(corporation_id: int, character_id: int) -> tuple[list[Any], bool]:
+    """Контракты корпорации (включая альянсовые, доступные корпорации) постранично (§9.1, §6.12).
+
+    Скоуп: ``esi-contracts.read_corporation_contracts.v1``.
+    Возвращает ``(контракты, partial)``: ``partial=True`` при нехватке лимита ошибок ESI.
+    """
+    token = _token_for_contracts(character_id, ContractSourceKind.CORPORATION)
+    contracts: list[Any] = []
+    op = esi.client.Contracts.GetCorporationsCorporationIdContracts
+    try:
+        for page_rows, _resp in _page_results(op, corporation_id=corporation_id, token=token):
+            contracts.extend(page_rows)
+        return contracts, False
+    except RateLimitStop:
+        return contracts, True
+
+
+def fetch_corporation_contract_items(corporation_id: int, contract_id: int, character_id: int) -> list[Any]:
+    """Позиции корпоративного/альянсового контракта (§9.1, §6.12)."""
+    token = _token_for_contracts(character_id, ContractSourceKind.CORPORATION)
+    op = esi.client.Contracts.GetCorporationsCorporationIdContractsContractIdItems
+
+    def _fetch():
+        data, response = op(corporation_id=corporation_id, contract_id=contract_id, token=token).result(
+            use_etag=False, return_response=True, use_cache=False
+        )
+        _check_error_limit(response)
+        return data if isinstance(data, list) else ([] if data is None else [data])
+
+    return _call_with_retry(_fetch)
+
+
+def fetch_character_contracts(character_id: int) -> tuple[list[Any], bool]:
+    """Контракты персонажа (персональные, корпоративные и альянсовые, видимые ему) постранично (§9.1, §6.12).
+
+    Скоуп: ``esi-contracts.read_character_contracts.v1``.
+    Возвращает ``(контракты, partial)``: ``partial=True`` при нехватке лимита ошибок ESI.
+    """
+    token = _token_for_contracts(character_id, ContractSourceKind.CHARACTER)
+    contracts: list[Any] = []
+    op = esi.client.Contracts.GetCharactersCharacterIdContracts
+    try:
+        for page_rows, _resp in _page_results(op, character_id=character_id, token=token):
+            contracts.extend(page_rows)
+        return contracts, False
+    except RateLimitStop:
+        return contracts, True
+
+
+def fetch_character_contract_items(contract_id: int, character_id: int) -> list[Any]:
+    """Позиции контракта, полученного через эндпоинт персонажа (§9.1, §6.12)."""
+    token = _token_for_contracts(character_id, ContractSourceKind.CHARACTER)
+    op = esi.client.Contracts.GetCharactersCharacterIdContractsContractIdItems
+
+    def _fetch():
+        data, response = op(character_id=character_id, contract_id=contract_id, token=token).result(
+            use_etag=False, return_response=True, use_cache=False
+        )
+        _check_error_limit(response)
+        return data if isinstance(data, list) else ([] if data is None else [data])
+
+    return _call_with_retry(_fetch)
+
+
+def _coerce_esi_datetime(value: Any) -> datetime | None:
+    """Нормализация даты/времени ответа ESI (datetime или ISO-строка) к aware UTC datetime."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        if timezone.is_naive(value):
+            return value.replace(tzinfo=dt_timezone.utc)
+        return value
+    parsed = parse_datetime(str(value))
+    if parsed is None:
+        return None
+    if timezone.is_naive(parsed):
+        return parsed.replace(tzinfo=dt_timezone.utc)
+    return parsed
+
+
+def build_contract_cache_row(
+    contract: Any,
+    *,
+    source_kind: str,
+    source_ref: int,
+    now: datetime | None = None,
+) -> dict | None:
+    """Преобразование сырого контракта ESI в строку ContractCache (§6.12, §8).
+
+    Пропускает контракты, не являющиеся активными ``item_exchange`` со статусом
+    ``outstanding`` и ``date_expired > now``. Цена приводится через ``Decimal`` без float.
+    """
+    current_time = now or timezone.now()
+    status = str(_order_field(contract, "status", "") or "")
+    contract_type = str(_order_field(contract, "type", "") or "")
+    if status != "outstanding" or contract_type != "item_exchange":
+        return None
+    date_expired = _coerce_esi_datetime(_order_field(contract, "date_expired"))
+    date_issued = _coerce_esi_datetime(_order_field(contract, "date_issued")) or current_time
+    if date_expired is None or date_expired <= current_time:
+        return None
+    start_location_id = _order_field(contract, "start_location_id")
+    contract_id = _order_field(contract, "contract_id")
+    if start_location_id is None or contract_id is None:
+        return None
+    raw_price = _order_field(contract, "price", 0) or 0
+    price = Decimal(str(raw_price)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    return {
+        "contract_id": int(contract_id),
+        "source_kind": source_kind,
+        "source_ref": int(source_ref),
+        "issuer_id": int(_order_field(contract, "issuer_id", 0) or 0),
+        "issuer_corporation_id": int(_order_field(contract, "issuer_corporation_id", 0) or 0),
+        "assignee_id": int(_order_field(contract, "assignee_id", 0) or 0),
+        "availability": str(_order_field(contract, "availability", "") or "")[:32],
+        "contract_type": contract_type[:32],
+        "status": status[:32],
+        "title": str(_order_field(contract, "title", "") or "")[:255],
+        "start_location_id": int(start_location_id),
+        "price": price,
+        "date_issued": date_issued,
+        "date_expired": date_expired,
+        "fetched_at": current_time,
+    }
+
+
+def build_contract_item_rows(items: Iterable[Any], *, contract_pk: int) -> list[dict]:
+    """Преобразование позиций контракта ESI в строки ContractItemCache (§6.12, §8)."""
+    rows: list[dict] = []
+    for item in items:
+        type_id = _order_field(item, "type_id")
+        if type_id is None:
+            continue
+        raw_qty = _order_field(item, "raw_quantity", None)
+        rows.append(
+            {
+                "contract_id": contract_pk,
+                "record_id": int(_order_field(item, "record_id", 0) or 0),
+                "type_id": int(type_id),
+                "quantity": int(_order_field(item, "quantity", 0) or 0),
+                "is_included": bool(_order_field(item, "is_included", True)),
+                "is_singleton": bool(_order_field(item, "is_singleton", False)),
+                "raw_quantity": int(raw_qty) if raw_qty is not None else None,
             }
         )
     return rows

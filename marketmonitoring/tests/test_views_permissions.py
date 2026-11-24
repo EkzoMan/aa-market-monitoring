@@ -378,7 +378,7 @@ def test_refresh_starts_chain(editor_client, monkeypatch):
     def _fake_delay(trigger, lock_token=None):
         called.append((trigger, lock_token))
 
-    for name in ("sync_jita_book", "sync_region_orders", "sync_structure_orders"):
+    for name in ("sync_contracts", "sync_jita_book", "sync_region_orders", "sync_structure_orders"):
         monkeypatch.setattr(
             f"marketmonitoring.views.refresh.{name}", type("T", (), {"delay": staticmethod(_fake_delay)})
         )
@@ -387,6 +387,7 @@ def test_refresh_starts_chain(editor_client, monkeypatch):
     lock_value = cache.get(SYNC_LOCK_KEY)
     assert lock_value is not None
     assert called == [
+        ("manual", lock_value),
         ("manual", lock_value),
         ("manual", lock_value),
         ("manual", lock_value),

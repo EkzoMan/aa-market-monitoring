@@ -14,8 +14,9 @@ from django.utils.translation import gettext as _
 
 from ..auth_hooks import has_edit
 from ..constants import ProviderStatus
-from ..forms import PluginSettingForm, ProviderAddForm, WebhookForm
-from ..models import PluginSetting, StructureProvider, WebhookConfig
+from ..esi.client import contract_scope_for_kind
+from ..forms import ContractProviderAddForm, PluginSettingForm, ProviderAddForm, WebhookForm
+from ..models import ContractProvider, PluginSetting, StructureProvider, WebhookConfig
 
 logger = logging.getLogger("marketmonitoring")
 
@@ -34,8 +35,17 @@ def _character_has_scopes(character_id: int) -> bool:
     return True
 
 
-def _settings_context(request, settings_form, webhook_form, provider_form):
-    """Общий контекст страницы настроек (§14): настройки + webhook + провайдеры."""
+def _character_has_contract_scope(character_id: int, source_kind: str) -> tuple[bool, str]:
+    """Проверка наличия скоупа чтения контрактов на токене персонажа AA (без сети, §9.1)."""
+    from esi.models import Token
+
+    scope = contract_scope_for_kind(source_kind)
+    exists = Token.objects.filter(character_id=character_id, scopes__name=scope).exists()
+    return exists, scope
+
+
+def _settings_context(request, settings_form, webhook_form, provider_form, contract_provider_form=None):
+    """Общий контекст страницы настроек (§14): настройки + webhook + провайдеры структур и контрактов."""
     return {
         "page_title": _("Settings"),
         "settings_form": settings_form,
@@ -43,6 +53,8 @@ def _settings_context(request, settings_form, webhook_form, provider_form):
         "webhook": WebhookConfig.objects.first(),
         "provider_form": provider_form,
         "providers": StructureProvider.objects.select_related("character").order_by("priority", "pk"),
+        "contract_provider_form": contract_provider_form or ContractProviderAddForm(),
+        "contract_providers": ContractProvider.objects.select_related("character").order_by("priority", "pk"),
         "provider_status_disabled": ProviderStatus.DISABLED,
     }
 
@@ -129,4 +141,81 @@ def provider_enable(request, provider_id: int):
         provider.cooldown_until = None
         provider.save(update_fields=["enabled", "status", "acl_fail_count", "cooldown_until"])
         messages.success(request, _("Provider re-enabled."))
+    return redirect("marketmonitoring:settings")
+
+
+@login_required
+def contract_provider_add(request):
+    """Привязка провайдера контрактов (POST, edit, §6.12, §9.1): персонаж AA с нужным скоупом."""
+    if not has_edit(request.user):
+        messages.warning(request, _("Permission denied."))
+        return redirect("marketmonitoring:index")
+
+    form = ContractProviderAddForm(request.POST or None)
+    if request.method == "POST" and form.is_valid():
+        character = form.cleaned_data["character"]
+        source_kind = form.cleaned_data["source_kind"]
+        has_scope, scope = _character_has_contract_scope(character.character_id, source_kind)
+        if not has_scope:
+            messages.error(
+                request,
+                _("Add the character with the required scope: %(scope)s.") % {"scope": scope},
+            )
+            return redirect("marketmonitoring:settings")
+        _provider, created = ContractProvider.objects.get_or_create(
+            character=character,
+            source_kind=source_kind,
+        )
+        if created:
+            messages.success(request, _("Contract provider added."))
+        else:
+            messages.warning(request, _("Contract provider already exists."))
+    return redirect("marketmonitoring:settings")
+
+
+@login_required
+def contract_provider_toggle(request, provider_id: int):
+    """Вкл/выкл провайдера контрактов (POST, edit, §14)."""
+    if not has_edit(request.user):
+        messages.warning(request, _("Permission denied."))
+        return redirect("marketmonitoring:index")
+
+    provider = get_object_or_404(ContractProvider, pk=provider_id)
+    if request.method == "POST":
+        provider.enabled = not provider.enabled
+        provider.status = ProviderStatus.OK if provider.enabled else ProviderStatus.DISABLED
+        provider.save(update_fields=["enabled", "status"])
+        messages.success(request, _("Contract provider updated."))
+    return redirect("marketmonitoring:settings")
+
+
+@login_required
+def contract_provider_enable(request, provider_id: int):
+    """Сброс disabled → enabled для провайдера контрактов (POST, edit, §11.5)."""
+    if not has_edit(request.user):
+        messages.warning(request, _("Permission denied."))
+        return redirect("marketmonitoring:index")
+
+    provider = get_object_or_404(ContractProvider, pk=provider_id)
+    if request.method == "POST":
+        provider.enabled = True
+        provider.status = ProviderStatus.OK
+        provider.acl_fail_count = 0
+        provider.cooldown_until = None
+        provider.save(update_fields=["enabled", "status", "acl_fail_count", "cooldown_until"])
+        messages.success(request, _("Contract provider re-enabled."))
+    return redirect("marketmonitoring:settings")
+
+
+@login_required
+def contract_provider_delete(request, provider_id: int):
+    """Удаление провайдера контрактов (POST, edit, §14)."""
+    if not has_edit(request.user):
+        messages.warning(request, _("Permission denied."))
+        return redirect("marketmonitoring:index")
+
+    provider = get_object_or_404(ContractProvider, pk=provider_id)
+    if request.method == "POST":
+        provider.delete()
+        messages.success(request, _("Contract provider removed."))
     return redirect("marketmonitoring:settings")

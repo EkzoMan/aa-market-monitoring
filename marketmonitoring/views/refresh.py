@@ -21,6 +21,7 @@ from ..constants import SyncRunStatus, TriggerKind
 from ..models import Fit, SyncRun
 from ..tasks import (
     SYNC_LOCK_KEY,
+    sync_contracts,
     sync_jita_book,
     sync_region_orders,
     sync_structure_orders,
@@ -53,6 +54,7 @@ def refresh(request):
         logger.info("Manual refresh rejected: sync lock is held")
         return HttpResponse(_("Update is already running."), status=409)
 
+    sync_contracts.delay(trigger=TriggerKind.MANUAL, lock_token=lock_token)
     sync_jita_book.delay(trigger=TriggerKind.MANUAL, lock_token=lock_token)
     sync_region_orders.delay(trigger=TriggerKind.MANUAL, lock_token=lock_token)
     sync_structure_orders.delay(trigger=TriggerKind.MANUAL, lock_token=lock_token)

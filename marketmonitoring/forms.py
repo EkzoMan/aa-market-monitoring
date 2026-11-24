@@ -3,7 +3,7 @@
 from django import forms
 from django.utils.translation import gettext_lazy as _
 
-from .constants import LocationKind, ScopeKind
+from .constants import ContractSourceKind, LocationKind, ScopeKind
 from .models import ComponentRequest, Fit, MarketLocation, PluginSetting, WebhookConfig
 
 # Число колонок в селекторе типов (без внешних CDN; обычный select по EveType).
@@ -260,6 +260,7 @@ class PluginSettingForm(forms.ModelForm):
                 "jita_type_batch",
                 "jita_sync_interval_min",
                 "stock_sync_interval_min",
+                "contracts_sync_interval_min",
                 "data_stale_after_min",
                 "provider_acl_cooldown_min",
                 "provider_acl_max_failures",
@@ -296,6 +297,29 @@ class ProviderAddForm(forms.Form):
     character = forms.ModelChoiceField(
         label=_("Character"),
         queryset=None,
+        widget=forms.Select(attrs={"class": "form-control"}),
+    )
+
+    def __init__(self, *args, **kwargs):
+        """Список персонажей — из справочника AA (eveonline), токены не хранятся (§8)."""
+        from allianceauth.eveonline.models import EveCharacter
+
+        super().__init__(*args, **kwargs)
+        self.fields["character"].queryset = EveCharacter.objects.all().order_by("character_name")
+
+
+class ContractProviderAddForm(forms.Form):
+    """Привязка провайдера контрактов: персонаж AA и вид источника контрактов (§6.12, §9.1)."""
+
+    character = forms.ModelChoiceField(
+        label=_("Character"),
+        queryset=None,
+        widget=forms.Select(attrs={"class": "form-control"}),
+    )
+    source_kind = forms.ChoiceField(
+        label=_("Contract source"),
+        choices=ContractSourceKind.choices,
+        initial=ContractSourceKind.CORPORATION,
         widget=forms.Select(attrs={"class": "form-control"}),
     )
 

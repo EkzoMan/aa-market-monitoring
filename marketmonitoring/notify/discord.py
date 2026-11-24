@@ -149,6 +149,37 @@ def send_deficit(
     )
 
 
+def send_contracts_deficit(
+    fit: Fit,
+    ships_available: int,
+    n: int,
+    scope_label: str,
+    state_hash: str,
+) -> tuple[bool, str]:
+    """Уведомление contracts_deficit (§13, §6.12): фит, C/N кораблей в контрактах,
+    нехватка N - C, область и ссылка на карточку фита; цвет оранжевый.
+    Дедупликация по cooldown выполняется вызывающим (tasks.notify_deficit).
+    """
+    missing = max(0, n - ships_available)
+    fields = [
+        {"name": "Ships on contract", "value": f"{ships_available}/{n}", "inline": True},
+        {"name": "Missing ships", "value": str(missing), "inline": True},
+        {"name": "Scope", "value": scope_label, "inline": False},
+    ]
+    embed = {
+        "title": f"CONTRACTS DEFICIT: {fit.name}",
+        "color": COLOR_DEFICIT,
+        "url": _card_url(fit),
+        "fields": fields,
+    }
+    return send_webhook(
+        embed=embed,
+        event=NotificationEvent.CONTRACTS_DEFICIT,
+        state_hash=state_hash,
+        fit=fit,
+    )
+
+
 def send_hull_missing(fit: Fit, scope_label: str, state_hash: str) -> tuple[bool, str]:
     """Уведомление hull_missing (§13): фит, область, ссылка; color красный."""
     embed = {

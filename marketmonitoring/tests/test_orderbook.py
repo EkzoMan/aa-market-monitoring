@@ -255,31 +255,26 @@ def test_build_order_cache_rows_filters_buy_orders():
 
 
 @pytest.mark.django_db
-def test_fetch_jita_orders_batch_halving(settings_row):
-    """При 400 из-за размера батча — уменьшение вдвое и повтор (§9.2).
-
-    Мок со спекой: проверяется page_size=1000, обход страниц до пустой и порядок батчей.
-    """
-    from esi.exceptions import HTTPClientError
-
+def test_fetch_jita_orders_per_type_pagination(settings_row):
+    """Обход стакана Jita по одиночным type_id с пагинацией по X-Pages/пустой странице (§9.1, §9.2)."""
     calls: list[dict] = []
     pages_seen: list[int] = []
 
     class FakeOp:
         """Мок операции GetMarketsRegionIdOrders со спекой вызова и result()."""
 
+        headers = {"X-Pages": "2"}
+
         def __call__(self, **kwargs):
             calls.append(kwargs)
             pages_seen.append(kwargs.get("page", 1))
-            if len(kwargs["type_id"]) > 1:
-                raise HTTPClientError(status_code=400, headers={}, data=None)
             return self
 
         def result(self, **kwargs):
             # Ровно одна непустая страница на вызов (page=1), вторая страница — пустая.
             if pages_seen[-1] >= 2:
                 return ([], self)
-            return ([_order(type_id=calls[-1]["type_id"][0])], self)
+            return ([_order(type_id=calls[-1]["type_id"])], self)
 
     fake_client = mock.Mock()
     fake_client.client.Market.GetMarketsRegionIdOrders = FakeOp()
@@ -289,14 +284,9 @@ def test_fetch_jita_orders_batch_halving(settings_row):
     ):
         orders, partial = esi_client.fetch_jita_orders([1, 2])
     assert partial is False
-    assert len(orders) == 2  # по одному заказу на каждый тип после уменьшения батча
-    # Все запросы — с page_size=1000 (§9.1).
-    assert all(call.get("page_size") == 1000 for call in calls)
-    # Первый вызов — исходный батч, после 400 идут одиночные батчи.
-    assert len(calls[0]["type_id"]) == 2
-    assert all(len(call["type_id"]) == 1 for call in calls[1:])
-    # Страницы обходятся до пустой: для каждого одиночного батча есть page=2.
-    assert pages_seen.count(2) >= 2
+    assert len(orders) == 2
+    assert [call["type_id"] for call in calls if call["page"] == 1] == [1, 2]
+    assert pages_seen.count(2) == 2
 
 
 @pytest.mark.django_db

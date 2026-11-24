@@ -11,7 +11,7 @@ from datetime import timedelta
 from django.utils import timezone
 
 from ..constants import NotificationEvent, ProviderStatus
-from ..models import PluginSetting, StructureProvider
+from ..models import ContractProvider, PluginSetting, StructureProvider
 
 logger = logging.getLogger("marketmonitoring")
 
@@ -135,3 +135,56 @@ def switch_to_next_provider(structure_id: int, failed_character_ids: set[int]) -
     """Структура после 403 переобрабатывается следующим доступным провайдером
     в том же прогоне (§11.2): выбор с исключением уже отказавших персонажей."""
     return select_provider(structure_id, exclude_character_ids=set(failed_character_ids))
+
+
+def available_contract_providers():
+    """Доступные провайдеры контрактов (§11, §6.12): enabled, не disabled, не в активном cooldown."""
+    now = timezone.now()
+    return (
+        ContractProvider.objects.select_related("character")
+        .filter(enabled=True)
+        .exclude(status=ProviderStatus.DISABLED)
+        .filter(_cooldown_ok_q(now))
+        .order_by("priority", "character__character_id", "pk")
+    )
+
+
+def handle_contract_provider_acl_failure(provider: ContractProvider) -> ContractProvider:
+    """Обработка 401/403 от ESI для провайдера контрактов (§11): cooldown и отключение при пороге."""
+    settings_obj = PluginSetting.load()
+    provider.acl_fail_count += 1
+    if provider.acl_fail_count >= settings_obj.provider_acl_max_failures:
+        provider.status = ProviderStatus.DISABLED
+        provider.cooldown_until = None
+        disabled = True
+        logger.warning(
+            "Contract provider %s (%s) disabled after %s ACL failures",
+            provider.character_id,
+            provider.source_kind,
+            provider.acl_fail_count,
+        )
+    else:
+        provider.status = ProviderStatus.COOLING_DOWN
+        provider.cooldown_until = timezone.now() + timedelta(minutes=settings_obj.provider_acl_cooldown_min)
+        disabled = False
+        logger.info(
+            "Contract provider %s (%s) cooling down until %s (ACL failure %s/%s)",
+            provider.character_id,
+            provider.source_kind,
+            provider.cooldown_until,
+            provider.acl_fail_count,
+            settings_obj.provider_acl_max_failures,
+        )
+    provider.save(update_fields=["acl_fail_count", "status", "cooldown_until"])
+    _notify_acl_lost(provider, disabled=disabled)
+    return provider
+
+
+def handle_contract_provider_success(provider: ContractProvider) -> ContractProvider:
+    """Успешный запрос контрактов сбрасывает acl_fail_count=0 и status=ok (§11.4)."""
+    if provider.acl_fail_count != 0 or provider.status != ProviderStatus.OK:
+        provider.acl_fail_count = 0
+        provider.status = ProviderStatus.OK
+        provider.cooldown_until = None
+        provider.save(update_fields=["acl_fail_count", "status", "cooldown_until"])
+    return provider

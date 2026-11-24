@@ -118,4 +118,79 @@
     </form>
   </div>
 </div>
+
+<div class="card mt-3">
+  <div class="card-header"><h3 class="card-title">{% translate "Contract providers" %}</h3></div>
+  <div class="card-body table-responsive">
+    {% if contract_providers %}
+    <table class="table table-sm table-hover align-middle mm-table">
+      <thead>
+        <tr>
+          <th>#</th>
+          <th>{% translate "Character" %}</th>
+          <th>{% translate "Source" %}</th>
+          <th>{% translate "Priority" %}</th>
+          <th>{% translate "Enabled" %}</th>
+          <th>{% translate "Status" %}</th>
+          <th>{% translate "Sync" %}</th>
+          <th class="text-end">{% translate "ACL failures" %}</th>
+          <th>{% translate "Last synced" %}</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for cprov in contract_providers %}
+        <tr>
+          <td>{{ forloop.counter }}</td>
+          <td class="mm-nowrap">{{ cprov.character }}</td>
+          <td><span class="badge text-bg-secondary">{{ cprov.source_kind }}</span></td>
+          <td class="mm-num">{{ cprov.priority }}</td>
+          <td>
+            <form method="post" action="{% url 'marketmonitoring:contract_provider_toggle' cprov.pk %}" class="form-check form-switch m-0">
+              {% csrf_token %}
+              <input type="checkbox" class="form-check-input" role="switch" {{ cprov.enabled|yesno:"checked," }}
+                     onchange="this.form.submit()" aria-label="{% translate 'Enabled' %}">
+            </form>
+          </td>
+          <td><span class="badge text-bg-{{ cprov.status|sync_status_class }}">{{ cprov.status }}</span></td>
+          <td><span class="badge text-bg-{{ cprov.sync_status|sync_status_class }}">{{ cprov.sync_status }}</span></td>
+          <td class="mm-num">{{ cprov.acl_fail_count }}</td>
+          <td class="mm-nowrap">{{ cprov.last_synced_at|date:"Y-m-d H:i" }}</td>
+          <td class="text-end mm-nowrap">
+            {% if cprov.status == provider_status_disabled %}
+            <form method="post" action="{% url 'marketmonitoring:contract_provider_enable' cprov.pk %}" class="d-inline">
+              {% csrf_token %}
+              <button type="submit" class="btn btn-outline-primary btn-sm">{% translate "Re-enable" %}</button>
+            </form>
+            {% endif %}
+            <form method="post" action="{% url 'marketmonitoring:contract_provider_delete' cprov.pk %}" class="d-inline">
+              {% csrf_token %}
+              <button type="submit" class="btn btn-outline-danger btn-sm">{% translate "Remove" %}</button>
+            </form>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <p class="text-body-secondary">{% translate "No contract providers yet." %}</p>
+    {% endif %}
+
+    <h5 class="mt-3">{% translate "Add contract provider" %}</h5>
+    <form method="post" action="{% url 'marketmonitoring:contract_provider_add' %}" class="row g-2 align-items-end">
+      {% csrf_token %}
+      {{ contract_provider_form.non_field_errors }}
+      <div class="col-12 col-md-5">{{ contract_provider_form.character }} {{ contract_provider_form.character.errors }}</div>
+      <div class="col-12 col-md-3">{{ contract_provider_form.source_kind }} {{ contract_provider_form.source_kind.errors }}</div>
+      <div class="col-12 col-md-auto">
+        <button type="submit" class="btn btn-primary btn-sm">{% translate "Add" %}</button>
+      </div>
+      <div class="col-12">
+        <small class="form-text text-body-secondary">
+          {% translate "Corporation/alliance contracts require esi-contracts.read_corporation_contracts.v1; character contracts require esi-contracts.read_character_contracts.v1." %}
+        </small>
+      </div>
+    </form>
+  </div>
+</div>
 {% endblock %}

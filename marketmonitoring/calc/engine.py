@@ -21,6 +21,9 @@ ZERO = Decimal("0")
 ONE = Decimal("1")
 HUNDRED = Decimal("100")
 
+# В ESI raw_quantity == -2 означает Blueprint Copy (BPC), который не является готовым предметом (§6.12).
+RAW_QUANTITY_BPC = -2
+
 
 @dataclass(frozen=True)
 class OrderBookRow:
@@ -231,4 +234,105 @@ def calc_component(
         shortfall=price.shortfall,
         is_overprice=overpriced,
         overprice_pct=calc_overprice_pct(price.unit, ref_price),
+    )
+
+
+@dataclass(frozen=True)
+class ContractItemInput:
+    """Позиция внутри контракта ESI для чистой проверки комплектности фита (§6.12)."""
+
+    type_id: int
+    quantity: int
+    is_included: bool = True
+    raw_quantity: int | None = None
+
+
+@dataclass(frozen=True)
+class ContractInput:
+    """Примитив открытого item_exchange контракта для расчётного ядра (§6.12)."""
+
+    contract_id: int
+    items: tuple[ContractItemInput, ...] | list[ContractItemInput]
+
+
+@dataclass(frozen=True)
+class ContractMatchResult:
+    """Подходящий контракт с числом полных комплектов кораблей в фите (§6.12)."""
+
+    contract_id: int
+    ships_count: int
+
+
+@dataclass(frozen=True)
+class ContractsFitCalcResult:
+    """Итог проверки достаточности кораблей в фите по контрактам (§6.12)."""
+
+    status: str
+    ships_available: int | None
+    deficit: int | None
+    matched_contracts: list[ContractMatchResult]
+
+
+def calc_contract_fit_sets(
+    items: list[ContractItemInput] | tuple[ContractItemInput, ...],
+    required_components: list[tuple[int, int]],
+) -> int:
+    """Число полных комплектов фита внутри одного контракта (§6.12).
+
+    Учитываются только вложенные продавцом позиции (``is_included=True``) с
+    положительным количеством, не являющиеся BPC (``raw_quantity != -2``).
+    Если хотя бы одной позиции фита (корпуса, модуля, рига, дрона или заряда)
+    не хватает, возвращает 0.
+    """
+    if not required_components:
+        return 0
+    totals_by_type: dict[int, int] = {}
+    for item in items:
+        if not item.is_included or item.raw_quantity == RAW_QUANTITY_BPC or item.quantity <= 0:
+            continue
+        totals_by_type[item.type_id] = totals_by_type.get(item.type_id, 0) + item.quantity
+    sets_per_component: list[int] = []
+    for type_id, qty_per_fit in required_components:
+        if qty_per_fit <= 0:
+            return 0
+        sets_per_component.append(totals_by_type.get(type_id, 0) // qty_per_fit)
+    return min(sets_per_component)
+
+
+def calc_contracts_fit(
+    contracts: list[ContractInput],
+    required_components: list[tuple[int, int]],
+    qty_target: int,
+    has_no_data: bool,
+) -> ContractsFitCalcResult:
+    """Проверка достаточности кораблей в фите по открытым контрактам (§6.12).
+
+    Чистая функция: дедуплицирует контракты по ``contract_id``, считает полные
+    комплекты ``ships_c`` в каждом контракте, суммирует ``C``, вычисляет дефицит
+    ``max(0, N - C)`` и статус ``no_data | deficit | ok``.
+    """
+    if has_no_data or not required_components:
+        return ContractsFitCalcResult(
+            status=STATUS_NO_DATA,
+            ships_available=None,
+            deficit=None,
+            matched_contracts=[],
+        )
+    seen_ids: set[int] = set()
+    matched: list[ContractMatchResult] = []
+    for contract in contracts:
+        if contract.contract_id in seen_ids:
+            continue
+        seen_ids.add(contract.contract_id)
+        ships = calc_contract_fit_sets(contract.items, required_components)
+        if ships > 0:
+            matched.append(ContractMatchResult(contract_id=contract.contract_id, ships_count=ships))
+    total_ships = sum(m.ships_count for m in matched)
+    deficit = calc_deficit(qty_target, 1, total_ships)
+    status = STATUS_DEFICIT if total_ships < qty_target else STATUS_OK
+    return ContractsFitCalcResult(
+        status=status,
+        ships_available=total_ships,
+        deficit=deficit,
+        matched_contracts=matched,
     )

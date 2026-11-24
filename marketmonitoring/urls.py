@@ -33,6 +33,22 @@ urlpatterns = [
     path("settings/provider/add/", settings_views.provider_add, name="provider_add"),
     path("settings/provider/<int:provider_id>/toggle/", settings_views.provider_toggle, name="provider_toggle"),
     path("settings/provider/<int:provider_id>/enable/", settings_views.provider_enable, name="provider_enable"),
+    path("settings/contract-provider/add/", settings_views.contract_provider_add, name="contract_provider_add"),
+    path(
+        "settings/contract-provider/<int:provider_id>/toggle/",
+        settings_views.contract_provider_toggle,
+        name="contract_provider_toggle",
+    ),
+    path(
+        "settings/contract-provider/<int:provider_id>/enable/",
+        settings_views.contract_provider_enable,
+        name="contract_provider_enable",
+    ),
+    path(
+        "settings/contract-provider/<int:provider_id>/delete/",
+        settings_views.contract_provider_delete,
+        name="contract_provider_delete",
+    ),
     path("refresh/", refresh.refresh, name="refresh"),
     path("refresh/status/", refresh.refresh_status, name="refresh_status"),
 ]

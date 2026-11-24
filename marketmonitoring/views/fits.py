@@ -381,11 +381,13 @@ def fit_detail(request, fit_id: int):
     from django.apps import apps
 
     from ..calc import engine
+    from ..calc.service import evaluate_fit_contracts
     from ..constants import ScopeKind
     from ..models import FitComponent
     from ._calc_view import build_fit_component_rows
 
     fit = get_object_or_404(Fit, pk=fit_id)
+    contracts_res, matched_contracts, contracts_reasons = evaluate_fit_contracts(fit)
     data = build_fit_component_rows(fit)
     components = data.components
 
@@ -452,9 +454,16 @@ def fit_detail(request, fit_id: int):
         fit.total_cost if fit.status_cache == status else sum((r.cost for r in data.calc_results), Decimal("0"))
     )
 
+    contract_rows = [{"contract": contract, "ships_count": ships_count} for contract, ships_count in matched_contracts]
+
     context = {
         "page_title": fit.name,
         "fit": fit,
+        "contracts_status": contracts_res.status,
+        "contracts_available": contracts_res.ships_available,
+        "contracts_deficit": contracts_res.deficit,
+        "contracts_reasons": contracts_reasons,
+        "contract_rows": contract_rows,
         "status": status,
         "k": None if no_data else k,
         "total_cost": display_total,
