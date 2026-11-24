@@ -17,6 +17,7 @@ from ..calc import service as calc_service
 from ..forms import ComponentRequestForm
 from ..models import ComponentRequest
 from ._calc_view import build_component_request_rows
+from .dashboard import _scope_labels
 
 logger = logging.getLogger("marketmonitoring")
 
@@ -38,6 +39,8 @@ def components(request):
 
     requests = list(ComponentRequest.objects.all().order_by("pk"))
     type_names = dict(EveType.objects.filter(pk__in={r.type_id for r in requests}).values_list("pk", "name"))
+    # Человекочитаемые подписи областей из SDE (eveuniverse), пакетно без N+1 (§22.4).
+    scope_labels = _scope_labels([(r.scope_kind, r.scope_ref) for r in requests])
     rows = []
     for row in build_component_request_rows(requests):
         request_obj = row["obj"]
@@ -45,6 +48,8 @@ def components(request):
             {
                 "obj": request_obj,
                 "type_name": str(type_names.get(request_obj.type_id, f"type {request_obj.type_id}")),
+                # _scope_labels всегда даёт подпись (fallback "<kind> <ref>" включён).
+                "scope_label": scope_labels[(request_obj.scope_kind, request_obj.scope_ref)],
                 "status": row["status"],
                 "deficit": row["deficit"],
                 "cost": row["cost"],

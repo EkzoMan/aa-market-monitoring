@@ -77,6 +77,8 @@ class ComponentCalcResult:
     is_not_covered: bool
     shortfall: int
     is_overprice: bool
+    # Процент превышения unit над ref (§6.8) для tooltip бейджа; None при отсутствии данных.
+    overprice_pct: Decimal | None = None
 
 
 def covering_price(book: list[OrderBookRow], deficit: int) -> CoveringPriceResult:
@@ -161,6 +163,18 @@ def is_overprice(unit: Decimal | None, ref_price: Decimal | None, threshold_pct:
     return unit > threshold
 
 
+def calc_overprice_pct(unit: Decimal | None, ref_price: Decimal | None) -> Decimal | None:
+    """Процент превышения цены покрытия над ref (§6.8): unit / ref * 100 - 100.
+
+    Чистая функция для tooltip бейджа OVERPRICE; Decimal без float (§22.4),
+    квантование до 0.01 с ROUND_HALF_UP. None при отсутствии unit/ref или ref == 0.
+    """
+    if unit is None or ref_price is None or ref_price == ZERO:
+        return None
+    pct = unit / ref_price * HUNDRED - HUNDRED
+    return pct.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
 def calc_fit_status(has_no_data: bool, hull_available: int, k: int, n: int, allow_hull_missing: bool = False) -> str:
     """Статус с приоритетом NO_DATA > HULL_MISSING > DEFICIT > OK (§6.4).
 
@@ -216,4 +230,5 @@ def calc_component(
         is_not_covered=price.is_not_covered,
         shortfall=price.shortfall,
         is_overprice=overpriced,
+        overprice_pct=calc_overprice_pct(price.unit, ref_price),
     )

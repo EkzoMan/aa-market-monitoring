@@ -639,3 +639,20 @@ def test_region_sync_freshness_uses_needed_locations_only(sde_ids):
     fit.refresh_from_db()
     assert fit.status_cache == FitStatus.NO_DATA
     assert any("region 10000002" in reason for reason in result.reasons)
+
+
+# --- calc_overprice_pct (§6.8): процент превышения для tooltip бейджа ---
+
+
+def test_calc_overprice_pct_basic():
+    """unit/ref*100 - 100, Decimal без float, квантование до 0.01 (§22.4)."""
+    assert engine.calc_overprice_pct(D("125"), D("100")) == D("25.00")
+    assert engine.calc_overprice_pct(D("1"), D("3")) == D("-66.67")
+    assert engine.calc_overprice_pct(D("4995.005994005994"), D("1")) == D("499400.60")
+
+
+def test_calc_overprice_pct_none_inputs():
+    """None при отсутствии unit/ref или ref == 0."""
+    assert engine.calc_overprice_pct(None, D("100")) is None
+    assert engine.calc_overprice_pct(D("100"), None) is None
+    assert engine.calc_overprice_pct(D("100"), D("0")) is None

@@ -19,7 +19,7 @@
   <strong>{% translate "Parse errors" %}:</strong>
   <ul class="mb-0 mt-2">
   {% for error in parse_errors %}
-      <li>{{ error.line_no }}: {{ error.line }} — {{ error.message }}</li>
+      <li>{{ error }}</li>
   {% endfor %}
   </ul>
 </div>
@@ -28,7 +28,7 @@
 <div class="card card-primary">
   <div class="card-header">
     <h3 class="card-title">{{ page_title }}</h3>
-    {% if parsed %}
+    {% if preview_rows %}
     <span class="text-body-secondary small">{% translate "Steps 2–3: preview &amp; parameters" %}</span>
     {% else %}
     <span class="text-body-secondary small">{% translate "Step 1 of 3: paste EFT" %}</span>
@@ -39,8 +39,11 @@
       {% csrf_token %}
       {{ form.non_field_errors }}
 
-      {% if parsed %}
-      {# Шаг 2: предпросмотр разбора (03-fit-wizard.md §2). #}
+      {% if preview_rows %}
+      {# Шаг 2: предпросмотр разбора с правкой состава (§7.5, FR-3/FR-4):
+         правка qty_per_fit, удаление строк, добавление типов через SDE-селектор
+         (type_search, без ESI), per-component override области.
+         Правки передаются в POST ManagementForm-подобными полями row<i>-<field>. #}
       <h5>{% translate "Parsed components" %}</h5>
       <div class="table-responsive mb-3">
         <table class="table table-sm table-hover align-middle mm-table">
@@ -50,28 +53,74 @@
               <th class="text-end">{% translate "Qty per fit" %}</th>
               <th>{% translate "Charge" %}</th>
               <th>{% translate "Hull" %}</th>
+              <th>{% translate "Scope override" %}</th>
+              <th class="text-center">{% translate "Delete" %}</th>
               <th>{% translate "Raw line" %}</th>
             </tr>
           </thead>
           <tbody>
-            {% for item in parsed %}
-            <tr {% if item.is_hull %}class="mm-hull-row"{% endif %}>
+            {% for row in preview_rows %}
+            {% if row.form %}
+            <tr {% if row.is_hull %}class="mm-hull-row"{% endif %}>
               <td class="mm-nowrap">
-                {% if item.type_id %}{% type_name item.type_id %}{% else %}<code>{{ item.raw_line }}</code>{% endif %}
-                {% if item.is_hull %}<span class="badge text-bg-primary">{% translate "HULL" %}</span>{% endif %}
+                {{ row.type_name }}{% if row.added %}<span class="badge text-bg-secondary ms-1">{% translate "ADDED" %}</span>{% endif %}
+                {% if row.is_hull %}<span class="badge text-bg-primary">{% translate "HULL" %}</span>{% endif %}
               </td>
-              <td class="mm-num">{{ item.qty_per_fit }}</td>
-              <td>{{ item.is_charge|yesno:"yes,no" }}</td>
-              <td>{{ item.is_hull|yesno:"yes,no" }}</td>
-              <td><code>{{ item.raw_line }}</code></td>
+              <td class="mm-num">{{ row.form.type_id }}{{ row.form.qty_per_fit }}{{ row.form.qty_per_fit.errors }}</td>
+              <td>{{ row.is_charge|yesno:"yes,no" }}{{ row.form.is_charge }}</td>
+              <td>{{ row.is_hull|yesno:"yes,no" }}</td>
+              <td class="mm-nowrap">
+                {# Инвариант §5.3: область корпуса = область фита — override корпуса выключен. #}
+                {% if row.is_hull %}
+                <span title="{% translate 'Hull scope follows the fit scope.' %}">
+                  {{ row.form.scope_override_kind }} {{ row.form.scope_override_ref }}
+                </span>
+                {% else %}
+                {{ row.form.scope_override_kind }} {{ row.form.scope_override_ref }}
+                {{ row.form.scope_override_kind.errors }}{{ row.form.scope_override_ref.errors }}
+                {% endif %}
+              </td>
+              <td class="text-center">{{ row.form.delete }}</td>
+              <td>{{ row.form.raw_line }}{% if row.raw_line %}<code>{{ row.raw_line }}</code>{% endif %}</td>
             </tr>
+            {% else %}
+            {# Строка без распознанного типа (ошибка парсера): read-only. #}
+            <tr>
+              <td colspan="7"><code>{{ row.raw_line }}</code></td>
+            </tr>
+            {% endif %}
             {% endfor %}
           </tbody>
         </table>
       </div>
+      {# Добавление типа через SDE-селектор (JSON-поиск type_search, UI к ESI не обращается).
+         Прототип строки рендерит Django (row_proto): choices областей не дублируются в JS. #}
+      <template id="mm-add-row-template">
+        <tr>
+          <td class="mm-nowrap"><span data-role="name"></span>{{ row_proto.type_id }}</td>
+          <td class="mm-num">{{ row_proto.qty_per_fit }}</td>
+          <td>no{{ row_proto.is_charge }}</td>
+          <td>no</td>
+          <td class="mm-nowrap">{{ row_proto.scope_override_kind }} {{ row_proto.scope_override_ref }}</td>
+          <td class="text-center">{{ row_proto.delete }}</td>
+          <td>{{ row_proto.raw_line }}</td>
+        </tr>
+      </template>
+      <div class="row g-2 align-items-end mb-3" id="mm-add-row-block">
+        <div class="col-12 col-md-5">
+          <label class="form-label" for="mm-add-type-search">{% translate "Add component (search by name)" %}</label>
+          <input type="text" id="mm-add-type-search" class="form-control form-control-sm" autocomplete="off" placeholder="{% translate 'Start typing a type name' %}">
+          <select id="mm-add-type-results" class="form-control form-control-sm mt-1" size="5" style="display:none"></select>
+        </div>
+        <div class="col-auto">
+          <button type="button" id="mm-add-row-btn" class="btn btn-outline-primary btn-sm">
+            <i class="fas fa-plus me-1" aria-hidden="true"></i>{% translate "Add row" %}
+          </button>
+        </div>
+      </div>
       <p class="text-body-secondary small">
         <i class="fas fa-circle-info me-1" aria-hidden="true"></i>
-        {% translate "HULL row: scope of the hull is the fit scope." %}
+        {% translate "HULL row: scope of the hull is the fit scope. The hull row cannot be deleted." %}
       </p>
       {% endif %}
 
@@ -89,7 +138,88 @@
         <button class="btn btn-success" name="action" value="save">{% translate "Save fit" %}</button>
         <a href="{% url 'marketmonitoring:index' %}" class="btn btn-outline-secondary">{% translate "Cancel" %}</a>
       </div>
+      {# Счётчик строк предпросмотра (ManagementForm-подобный формат row<i>-<field>). #}
+      <input type="hidden" name="rows_count" id="id_rows_count" value="{{ preview_rows|length }}">
     </form>
   </div>
 </div>
+
+{# Добавление строки через SDE-селектор: JSON-поиск type_search (без ESI, §5.10).
+   Строка клонируется из <template> с Django-рендером (row_proto) — значения
+   префикса __proto__ заменяются на row<i>-; choices не дублируются в JS.
+   Дубликат типа при добавлении запрещён (проверка в JS + на сервере). #}
+<script>
+  (function () {
+    var input = document.getElementById("mm-add-type-search");
+    var box = document.getElementById("mm-add-type-results");
+    var addBtn = document.getElementById("mm-add-row-btn");
+    var tbody = document.querySelector(".mm-table tbody");
+    var counter = document.getElementById("id_rows_count");
+    var template = document.getElementById("mm-add-row-template");
+    if (!input || !box || !addBtn || !tbody || !counter || !template) return;
+    var timer = null;
+    var picked = null;
+    function render(results) {
+      box.innerHTML = "";
+      if (!results.length) { box.style.display = "none"; return; }
+      results.forEach(function (r) {
+        var opt = document.createElement("option");
+        opt.value = r.type_id;
+        opt.textContent = r.name + " (" + r.type_id + ")";
+        box.appendChild(opt);
+      });
+      box.style.display = "block";
+    }
+    input.addEventListener("input", function () {
+      picked = null;
+      window.clearTimeout(timer);
+      var q = input.value.trim();
+      if (q.length < 2) { box.style.display = "none"; return; }
+      timer = window.setTimeout(function () {
+        fetch("{% url 'marketmonitoring:type_search' %}?q=" + encodeURIComponent(q))
+          .then(function (r) { return r.json(); })
+          .then(function (data) { render(data.results || []); })
+          .catch(function () {});
+      }, 300);
+    });
+    box.addEventListener("change", function () {
+      picked = {typeId: box.value, name: box.selectedOptions[0].textContent};
+      input.value = picked.name;
+      box.style.display = "none";
+    });
+    function typeAlreadyPresent(typeId) {
+      var hidden = tbody.querySelectorAll('input[name$="-type_id"]');
+      for (var i = 0; i < hidden.length; i++) {
+        if (hidden[i].value === String(typeId)) return true;
+      }
+      return false;
+    }
+    addBtn.addEventListener("click", function () {
+      if (!picked) return;
+      if (typeAlreadyPresent(picked.typeId)) {
+        input.setCustomValidity("This type is already in the fit.");
+        input.reportValidity();
+        input.value = "";
+        picked = null;
+        return;
+      }
+      var idx = counter.value;
+      var tr = template.content.firstElementChild.cloneNode(true);
+      tr.querySelectorAll("[name]").forEach(function (el) {
+        el.name = el.name.replace("__proto__", "row" + idx);
+        if (el.id) el.id = el.id.replace("__proto__", "row" + idx);
+      });
+      var nameSpan = tr.querySelector("[data-role='name']");
+      nameSpan.textContent = picked.name;
+      tr.querySelector('input[name="row' + idx + '-type_id"]').value = picked.typeId;
+      tr.querySelector('input[name="row' + idx + '-is_charge"]').value = "false";
+      tr.querySelector('input[name="row' + idx + '-raw_line"]').value = "";
+      tbody.appendChild(tr);
+      counter.value = String(parseInt(counter.value, 10) + 1);
+      input.setCustomValidity("");
+      input.value = "";
+      picked = null;
+    });
+  })();
+</script>
 {% endblock %}

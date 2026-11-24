@@ -51,16 +51,52 @@ class FitForm(forms.ModelForm):
         return cleaned
 
 
-# TODO(этап 5 UI): подключить к предпросмотру правки состава.
 class FitComponentRowForm(forms.Form):
-    """Правка одной позиции предпросмотра: количество и удаление строки (§7.5)."""
+    """Правка одной позиции предпросмотра (§7.5, FR-3/FR-4): количество, удаление,
+    добавление типов через SDE-селектор, per-component override области.
+
+    Строки предпросмотра рендерятся с префиксом ``row<i>-`` (ManagementForm-подобный
+    формат): view собирает правки из POST по этому шаблону имён, поэтому правки
+    переживают повторный разбор (action=parse) и применяются к итоговому составу
+    при action=save.
+    """
 
     type_id = forms.IntegerField(widget=forms.HiddenInput)
-    qty_per_fit = forms.IntegerField(min_value=1, initial=1, required=False)
+    qty_per_fit = forms.IntegerField(
+        min_value=1,
+        initial=1,
+        widget=forms.NumberInput(
+            attrs={"class": "form-control form-control-sm mm-num", "min": 1, "style": "width: 6rem"}
+        ),
+    )
     delete = forms.BooleanField(required=False)
-    # per-component override области (§7.5)
-    scope_override_kind = forms.ChoiceField(choices=[("", "---------")] + list(ScopeKind.choices), required=False)
-    scope_override_ref = forms.IntegerField(required=False)
+    scope_override_kind = forms.ChoiceField(
+        choices=[("", "---------")] + list(ScopeKind.choices),
+        required=False,
+        widget=forms.Select(attrs={"class": "form-control form-control-sm"}),
+    )
+    scope_override_ref = forms.IntegerField(
+        required=False, widget=forms.NumberInput(attrs={"class": "form-control form-control-sm mm-num"})
+    )
+    # Служебные поля, чтобы предпросмотр после re-parse сохранил вид строки.
+    is_charge = forms.BooleanField(required=False, widget=forms.HiddenInput)
+    raw_line = forms.CharField(required=False, widget=forms.HiddenInput)
+
+    def clean(self):
+        """Кросс-валидация строки (§7.5): количество >= 1, override области — парой kind+ref."""
+        cleaned = super().clean()
+        kind = cleaned.get("scope_override_kind")
+        ref = cleaned.get("scope_override_ref")
+        if kind and not ref:
+            raise forms.ValidationError(_("Scope override reference is required when a scope kind is set."))
+        if ref and not kind:
+            raise forms.ValidationError(_("Scope override kind is required when a reference is set."))
+        if cleaned.get("delete"):
+            return cleaned
+        qty = cleaned.get("qty_per_fit")
+        if qty is None or qty < 1:
+            raise forms.ValidationError(_("Quantity per fit must be >= 1."))
+        return cleaned
 
 
 # ---------------------------------------------------------------------------

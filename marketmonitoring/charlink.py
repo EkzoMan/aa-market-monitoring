@@ -17,6 +17,8 @@ logger = get_extension_logger(__name__)
 SCOPES = [
     "esi-markets.structure_markets.v1",
     "esi-universe.read_structures.v1",
+    # Поиск структур персонажа (§9 шаг 1) — структуры корпорации, доступные для дока.
+    "esi-search.search_structures.v1",
 ]
 
 

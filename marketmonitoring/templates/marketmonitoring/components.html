@@ -48,7 +48,7 @@
         <tr {% if row.deficit is not None and row.deficit == 0 and row.status != 'no_data' %}class="text-body-secondary"{% endif %}>
           <td class="mm-nowrap">{{ row.type_name }}</td>
           <td class="mm-num">{{ row.obj.qty_target }}</td>
-          <td>{{ row.obj.get_scope_kind_display }} {{ row.obj.scope_ref }}</td>
+          <td>{{ row.scope_label }}</td>
           <td><span class="badge text-bg-{{ row.status|status_class }}">{{ row.status|upper }}</span></td>
           <td class="mm-num">{{ row.deficit|default_if_none:"—" }}</td>
           <td class="mm-num">{% if row.status == 'no_data' %}&mdash;{% else %}{{ row.cost|isk }}{% endif %}</td>

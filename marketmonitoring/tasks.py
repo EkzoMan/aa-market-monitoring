@@ -41,6 +41,10 @@ logger = logging.getLogger("marketmonitoring")
 # Ключ блокировки ручного обновления (§12.4).
 SYNC_LOCK_KEY = "mm:sync_lock"
 
+# Кэш результатов поиска структур (§9): префикс ключа и TTL.
+SEARCH_CACHE_PREFIX = "mm:structure_search"
+SEARCH_RESULT_TTL_SECONDS = 300
+
 # Guard-интервалы (§12.2).
 CLEANUP_INTERVAL_HOURS = 24
 VERIFY_PROVIDERS_INTERVAL_MIN = 60
@@ -286,6 +290,36 @@ def _chain_recalc_and_notify(trigger: str, location_ids: list[int] | None, lock_
     recalc_stock_levels.delay(trigger=trigger, location_ids=location_ids, lock_token=lock_token)
     if trigger == TriggerKind.BEAT and PluginSetting.load().notification_deficit_enabled:
         notify_deficit.delay(trigger=trigger)
+
+
+@shared_task(name="marketmonitoring.search_structures")
+def search_structures(character_id: int, query: str, job_id: str) -> dict:
+    """Поиск структур персонажа (§9 шаги 1–3) — единственное место обращения к ESI (§5.10).
+
+    Результат [{id, name, solar_system_id, region_id}] кладётся в кэш Django
+    по ключу job_id (TTL 300 с); region_id резолвится из SDE (eveuniverse,
+    без ESI). Ошибка не ретраится — результат запроса уже виден в UI.
+    """
+    cache_key = f"{SEARCH_CACHE_PREFIX}:{job_id}"
+    try:
+        rows = esi_client.search_structures_for_character(character_id, query)
+        # region_id — из справочника SDE (eveuniverse), без ESI (§8).
+        system_ids = {row["solar_system_id"] for row in rows if row.get("solar_system_id")}
+        region_by_system: dict[int, int | None] = {}
+        if system_ids:
+            from eveuniverse.models import EveSolarSystem
+
+            region_by_system = dict(
+                EveSolarSystem.objects.filter(pk__in=system_ids).values_list("pk", "eve_constellation__eve_region_id")
+            )
+        for row in rows:
+            row["region_id"] = region_by_system.get(row.get("solar_system_id"))
+        cache.set(cache_key, {"status": "done", "results": rows}, SEARCH_RESULT_TTL_SECONDS)
+        return {"ok": True, "count": len(rows)}
+    except Exception as exc:  # noqa: BLE001 — ошибка поиска отдаётся в UI через кэш
+        logger.warning("Structure search failed (character %s): %s", character_id, exc)
+        cache.set(cache_key, {"status": "error", "error": str(exc), "results": []}, SEARCH_RESULT_TTL_SECONDS)
+        return {"ok": False, "error": str(exc)}
 
 
 @shared_task(bind=True, name="marketmonitoring.sync_jita_book")

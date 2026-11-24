@@ -23,6 +23,10 @@ SCOPE_STRUCTURE_MARKETS = "esi-markets.structure_markets.v1"
 SCOPE_READ_STRUCTURES = "esi-universe.read_structures.v1"
 PROVIDER_SCOPES = [SCOPE_STRUCTURE_MARKETS, SCOPE_READ_STRUCTURES]
 
+# Скоуп поиска структур персонажа (§9 шаг 1) — структуры, на которые у
+# персонажа есть права дока (включая структуры его корпорации).
+SCOPE_SEARCH_STRUCTURES = "esi-search.search_structures.v1"
+
 # Порог заголовка X-ESI-Error-Limit-Remain (§9.2).
 ERROR_LIMIT_REMAIN_THRESHOLD = 10
 
@@ -226,6 +230,81 @@ def _token_for_provider(character_id: int) -> Token:
     if token is None:
         raise ValueError(f"No valid AA token with scopes {PROVIDER_SCOPES} for character {character_id}")
     return token
+
+
+def get_search_token(character_id: int) -> Token | None:
+    """Токен персонажа со скоупом поиска структур (§9 шаг 1); плагин токены не хранит."""
+    return (
+        Token.objects.filter(character_id=character_id)
+        .require_scopes(SCOPE_SEARCH_STRUCTURES)
+        .require_valid()
+        .order_by("pk")
+        .first()
+    )
+
+
+def list_search_characters(user) -> list[int]:
+    """character_id всех персонажей пользователя с валидным токеном поиска структур (§9).
+
+    Запрос в БД AA (не ESI) — допустим из view для выбора персонажа.
+    """
+    return list(
+        Token.objects.filter(user=user)
+        .require_scopes(SCOPE_SEARCH_STRUCTURES)
+        .require_valid()
+        .values_list("character_id", flat=True)
+        .distinct()
+        .order_by("character_id")
+    )
+
+
+def search_structures_for_character(character_id: int, query: str) -> list[dict]:
+    """Поиск структур, доступных персонажу для дока (§9 шаги 1–3), включая структуры корпорации.
+
+    Шаг 1: GET /characters/{id}/search/?categories=structure&search=<term> — токен
+    персонажа, скоуп esi-search.search_structures.v1; параметр search обязателен,
+    мин. ~3 символа (проверяется в view). Шаг 3: имя и система каждой структуры —
+    через GetUniverseStructuresStructureId тем же токеном; сбой имени не прерывает
+    результат (name=None). Дубликаты ID схлопываются (§9).
+    Возвращает [{id, name, solar_system_id}].
+    """
+    token = get_search_token(character_id)
+    if token is None:
+        raise ValueError(f"No valid AA token with scope {SCOPE_SEARCH_STRUCTURES} for character {character_id}")
+
+    def _search():
+        return esi.client.Search.GetCharactersCharacterIdSearch(
+            character_id=character_id, categories=["structure"], search=query, token=token
+        ).result(use_etag=False, use_cache=False)
+
+    data = _call_with_retry(_search)
+    raw_ids = data.get("structure", []) if isinstance(data, dict) else getattr(data, "structure", None) or []
+
+    rows: list[dict] = []
+    seen: set[int] = set()
+    for item in raw_ids:
+        structure_id = int(item)
+        if structure_id in seen:
+            continue
+        seen.add(structure_id)
+        name = None
+        solar_system_id = None
+        try:
+            # Шаг 3 §9: имя и система структуры тем же токеном; сбой не критичен.
+            def _info():
+                return esi.client.Universe.GetUniverseStructuresStructureId(
+                    structure_id=structure_id, token=token
+                ).result(use_etag=False, use_cache=False)
+
+            info = _call_with_retry(_info)
+            name = info.get("name") if isinstance(info, dict) else getattr(info, "name", None)
+            solar_system_id = (
+                info.get("solar_system_id") if isinstance(info, dict) else getattr(info, "solar_system_id", None)
+            )
+        except Exception as exc:  # noqa: BLE001 — имя/система не критичны для результата поиска
+            logger.info("Structure info fetch failed for %s during search: %s", structure_id, exc)
+        rows.append({"id": structure_id, "name": name, "solar_system_id": solar_system_id})
+    return rows
 
 
 def fetch_structure_orders(structure_id: int, character_id: int) -> tuple[list[dict], bool]:

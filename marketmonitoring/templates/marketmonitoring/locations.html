@@ -92,10 +92,12 @@
           {{ form.station_id.errors }}
         </div>
         <div class="col-12 col-md-6 mm-structure-only">
+          <input type="text" id="structure-search" class="form-control form-control-sm" autocomplete="off" placeholder="{% translate 'Start typing a structure name (searches via ESI with your character token)' %}">
+          <select id="structure-search-results" class="form-control form-control-sm mt-1" size="5" style="display:none"></select>
           {{ form.structure_id.label_tag }} {{ form.structure_id }} {{ form.structure_id.errors }}
           {{ form.structure_name.label_tag }} {{ form.structure_name }} {{ form.structure_name.errors }}
           <small class="form-text text-body-secondary">
-            {% translate "The real structure name is fetched from ESI during the first sync (the UI itself never calls ESI)." %}
+            {% translate "The search runs in a Celery task with your character's ESI token (the UI itself never calls ESI). It finds structures you can dock at, including your corporation's structures. The real structure name is fetched from ESI during the first sync." %}
           </small>
         </div>
       </div>
@@ -186,6 +188,81 @@
             stationBox.appendChild(opt);
           });
           stationBox.style.display = data.results && data.results.length ? "block" : "none";
+        })
+        .catch(function () {});
+    }, 300);
+  });
+  // Поиск структур (§9): запуск Celery-задачи + поллинг результата из кэша.
+  // Найденная структура заполняет structure_id, систему, регион и временное имя.
+  var structureInput = document.getElementById("structure-search");
+  var structureBox = document.getElementById("structure-search-results");
+  var structureId = document.getElementById("id_structure_id");
+  var structureName = document.getElementById("id_structure_name");
+  var structureTimer = null;
+  var structurePoll = null;
+  function pickStructure() {
+    if (!structureBox.selectedIndex && structureBox.selectedIndex !== 0) return;
+    var opt = structureBox.selectedOptions[0];
+    if (!opt) return;
+    structureId.value = opt.value;
+    structureName.value = opt.textContent;
+    // Система и регион — из результата поиска (шаг 3 §9): форма требует систему,
+    // регион резолвится из SDE по системе (§8).
+    if (opt.getAttribute("data-system")) {
+      document.getElementById("system-search-id").value = opt.getAttribute("data-system");
+    }
+    if (opt.getAttribute("data-region")) {
+      document.getElementById("id_region_id").value = opt.getAttribute("data-region");
+    }
+    structureBox.style.display = "none";
+  }
+  structureBox.addEventListener("change", pickStructure);
+  structureBox.addEventListener("click", function () {
+    if (structureBox.selectedIndex >= 0) pickStructure();
+  });
+  function renderStructures(data) {
+    structureBox.innerHTML = "";
+    (data.results || []).forEach(function (r) {
+      var opt = document.createElement("option");
+      opt.value = r.id;
+      opt.textContent = r.name || ("Structure " + r.id);
+      opt.setAttribute("data-system", r.solar_system_id || "");
+      opt.setAttribute("data-region", r.region_id || "");
+      structureBox.appendChild(opt);
+    });
+    structureBox.style.display = data.results && data.results.length ? "block" : "none";
+  }
+  function pollStructure(jobId) {
+    var attempts = 0;
+    window.clearInterval(structurePoll);
+    structurePoll = window.setInterval(function () {
+      attempts += 1;
+      if (attempts > 20) { window.clearInterval(structurePoll); return; }
+      fetch("{% url 'marketmonitoring:structure_search_result' %}?job_id=" + jobId)
+        .then(function (r) { return r.json(); })
+        .then(function (data) {
+          if (data.status === "done") {
+            window.clearInterval(structurePoll);
+            renderStructures(data);
+          } else if (data.status === "error") {
+            window.clearInterval(structurePoll);
+            structureBox.style.display = "none";
+          }
+        })
+        .catch(function () {});
+    }, 500);
+  }
+  structureInput.addEventListener("input", function () {
+    window.clearTimeout(structureTimer);
+    window.clearInterval(structurePoll);
+    var q = structureInput.value.trim();
+    if (q.length < 3) { structureBox.style.display = "none"; return; }
+    structureTimer = window.setTimeout(function () {
+      fetch("{% url 'marketmonitoring:structure_search_start' %}?q=" + encodeURIComponent(q))
+        .then(function (r) { return r.json(); })
+        .then(function (data) {
+          if (data.job_id) pollStructure(data.job_id);
+          else structureBox.style.display = "none";
         })
         .catch(function () {});
     }, 300);
