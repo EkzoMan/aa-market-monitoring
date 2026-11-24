@@ -74,7 +74,7 @@ def test_parse_keeps_edits_between_parses(eve_types, editor_client):  # noqa: F8
     assert Fit.objects.count() == 0  # parse не сохраняет
 
 
-def test_save_applies_edits_and_scope_override(eve_types, editor_client):  # noqa: F811
+def test_save_applies_edits_and_scope_override(eve_types, sde_ids, editor_client):  # noqa: F811
     """action=save применяет правки qty, удаление строки и override области (§7.5, FR-4)."""
     data = _post(action="save")
     data["row1-qty_per_fit"] = "9"  # Damage Control II: qty 1 -> 9
@@ -115,7 +115,7 @@ def test_save_rejects_zero_qty(eve_types, editor_client):  # noqa: F811
     assert not Fit.objects.filter(name="Edit test").exists()
 
 
-def test_save_adds_row_from_type_search(eve_types, editor_client):  # noqa: F811
+def test_save_adds_row_from_type_search(eve_types, sde_ids, editor_client):  # noqa: F811
     """Добавление типа через SDE-селектор (row4-поля): строка попадает в состав (§7.5, FR-3)."""
     data = _post(action="save")
     data["row4-type_id"] = "438"
@@ -140,7 +140,7 @@ def test_save_rejects_unknown_added_type(eve_types, editor_client):  # noqa: F81
     assert not Fit.objects.filter(name="Edit test").exists()
 
 
-def test_save_drops_hull_scope_override(eve_types, editor_client):  # noqa: F811
+def test_save_drops_hull_scope_override(eve_types, sde_ids, editor_client):  # noqa: F811
     """Инвариант §5.3: override области на hull-строке игнорируется при сохранении."""
     data = _post(action="save")
     data["row0-scope_override_kind"] = "system"
@@ -175,7 +175,7 @@ def test_save_rejects_duplicate_added_type(eve_types, editor_client):  # noqa: F
     assert "already in the fit" in response.content.decode()
 
 
-def test_save_added_row_is_charge_from_sde_category(eve_types, editor_client):  # noqa: F811
+def test_save_added_row_is_charge_from_sde_category(eve_types, sde_ids, editor_client):  # noqa: F811
     """is_charge добавленной строки наследуется от категории SDE-типа (Charge = 16), не от POST."""
     from eveuniverse.models import EveCategory, EveGroup, EveType
 
@@ -198,7 +198,7 @@ def test_save_added_row_is_charge_from_sde_category(eve_types, editor_client):  
     assert FitComponent.objects.get(fit=fit, type_id=421).is_charge is True
 
 
-def test_fit_update_applies_edits(eve_types, editor_client):  # noqa: F811
+def test_fit_update_applies_edits(eve_types, sde_ids, editor_client):  # noqa: F811
     """Правка существующего фита: override области сохраняется в FitComponent (§14)."""
     response = editor_client.post(reverse("marketmonitoring:fit_create"), _post(action="save"))
     assert response.status_code == 302
@@ -263,12 +263,3 @@ def test_fit_detail_overprice_tooltip_pct(editor_client, eve_types, sde_ids):  #
     content = editor_client.get(reverse("marketmonitoring:fit_detail", args=[fit.pk])).content.decode()
     assert "OVERPRICE" in content
     assert "+499900.00%" in content  # unit = 5000 (лот rank2 покрывает дефицит целиком), ref = 1
-
-
-def test_components_scope_label(eve_types, sde_ids, editor_client):  # noqa: F811
-    """Страница Components: человекочитаемое имя области вместо сырого kind+ref (§14)."""
-    from ..models import ComponentRequest
-
-    ComponentRequest.objects.create(type_id=2046, qty_target=5, scope_kind="system", scope_ref=30000142)
-    content = editor_client.get(reverse("marketmonitoring:components")).content.decode()
-    assert "system 30000142" not in content  # подпись резолвится из SDE через eveuniverse

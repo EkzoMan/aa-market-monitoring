@@ -4,7 +4,7 @@ from django import forms
 from django.utils.translation import gettext_lazy as _
 
 from .constants import ContractSourceKind, LocationKind, ScopeKind
-from .models import ComponentRequest, Fit, MarketLocation, PluginSetting, WebhookConfig
+from .models import ComponentRequest, Fit, MarketLocation, WebhookConfig
 
 # Число колонок в селекторе типов (без внешних CDN; обычный select по EveType).
 TYPE_SELECT_ATTRS = {"class": "form-control", "size": 1}
@@ -21,7 +21,18 @@ class FitForm(forms.ModelForm):
     scope_kind = forms.ChoiceField(
         label=_("Scope"),
         choices=ScopeKind.choices,
-        widget=forms.Select(attrs={"class": "form-control"}),
+        widget=forms.Select(attrs={"class": "form-control", "id": "id_scope_kind"}),
+    )
+    # scope_ref выбирается из списка через SDE-поиск (station/system/region),
+    # а не вводится числом: скрытое поле + текстовый поиск в шаблоне.
+    scope_ref = forms.IntegerField(widget=forms.HiddenInput(attrs={"id": "id_scope_ref"}))
+    scope_ref_name = forms.CharField(
+        label=_("Scope location"),
+        required=False,
+        widget=forms.TextInput(
+            attrs={"class": "form-control", "id": "scope-ref-search", "autocomplete": "off"}
+        ),
+        help_text=_("Start typing a station, system or region name; pick a suggestion."),
     )
 
     class Meta:
@@ -30,7 +41,6 @@ class FitForm(forms.ModelForm):
         widgets = {
             "name": forms.TextInput(attrs={"class": "form-control"}),
             "qty_target": forms.NumberInput(attrs={"class": "form-control", "min": 1}),
-            "scope_ref": forms.NumberInput(attrs={"class": "form-control"}),
         }
 
     def clean_qty_target(self) -> int:
@@ -41,13 +51,27 @@ class FitForm(forms.ModelForm):
         return qty
 
     def clean(self):
-        """Перекрёстная валидация: имя фита по умолчанию — из заголовка EFT."""
+        """Перекрёстная валидация: имя фита по умолчанию — из заголовка EFT;
+        scope_ref обязан существовать в справочнике SDE для выбранного вида области."""
+        from eveuniverse.models import EveRegion, EveSolarSystem, EveStation
+
         cleaned = super().clean()
         if not cleaned.get("name"):
             eft = cleaned.get("eft_raw") or ""
             first_line = eft.strip().splitlines()[0] if eft.strip() else ""
             if "," in first_line and first_line.startswith("["):
                 cleaned["name"] = first_line.strip()[1:-1].split(",", 1)[1].strip()
+
+        scope_kind = cleaned.get("scope_kind")
+        scope_ref = cleaned.get("scope_ref")
+        if scope_kind and scope_ref is not None:
+            model = {
+                ScopeKind.STATION: EveStation,
+                ScopeKind.SYSTEM: EveSolarSystem,
+                ScopeKind.REGION: EveRegion,
+            }.get(scope_kind)
+            if model is None or not model.objects.filter(pk=scope_ref).exists():
+                raise forms.ValidationError(_("Unknown scope reference (not found in SDE)."))
         return cleaned
 
 
@@ -190,7 +214,13 @@ class MarketLocationForm(forms.Form):
     )
 
     def clean(self):
-        """Кросс-валидация: обязательные поля по kind, уникальность (§8 UNIQUE), регион из SDE."""
+        """Кросс-валидация: обязательные поля по kind, уникальность (§8 UNIQUE), регион из SDE.
+
+        Для станции/системы система обязана быть в SDE (выбирается из справочника).
+        Для структуры (§9) система и регион приходят из ESI-поиска и могут
+        отсутствовать в локальном SDE — они резолвятся best-effort (0 = неизвестно,
+        дозаполнится при первом синке, как в sync-задаче).
+        """
         from eveuniverse.models import EveSolarSystem, EveStation
 
         cleaned = super().clean()
@@ -198,26 +228,60 @@ class MarketLocationForm(forms.Form):
         system_id = cleaned.get("solar_system_id")
 
         if system_id is None:
-            raise forms.ValidationError(_("Solar system is required."))
-        system = EveSolarSystem.objects.filter(pk=system_id).first()
-        if system is None:
-            raise forms.ValidationError(_("Unknown solar system (not found in SDE)."))
-        region_id = (
-            EveSolarSystem.objects.filter(pk=system_id)
-            .values_list("eve_constellation__eve_region_id", flat=True)
-            .first()
-        )
-        if region_id is None:
+            if kind == LocationKind.STRUCTURE:
+                # Система структуры неизвестна (ESI не отдал solar_system_id) —
+                # легитимный случай, дозаполнится при первом синке (§9).
+                system_id = 0
+                cleaned["solar_system_id"] = 0
+                cleaned["region_id_resolved"] = 0
+                system = None
+            else:
+                raise forms.ValidationError(_("Solar system is required."))
+        else:
+            system = EveSolarSystem.objects.filter(pk=system_id).first()
+
+        region_id = None
+        if system is not None:
+            region_id = (
+                EveSolarSystem.objects.filter(pk=system_id)
+                .values_list("eve_constellation__eve_region_id", flat=True)
+                .first()
+            )
+        if kind != LocationKind.STRUCTURE and (system is None or region_id is None):
+            # Станция/система выбираются из SDE — их отсутствие означает ошибку выбора.
+            if system is None:
+                raise forms.ValidationError(_("Unknown solar system (not found in SDE)."))
             raise forms.ValidationError(_("Cannot resolve region for the system from SDE."))
+        if region_id is None:
+            # Структура вне SDE: регион берётся из результата ESI-поиска, иначе 0.
+            posted_region = cleaned.get("region_id")
+            region_id = posted_region if isinstance(posted_region, int) and posted_region > 0 else 0
         cleaned["region_id_resolved"] = region_id
 
-        if kind == LocationKind.STATION:
+        if system is not None:
+            cleaned["system_name"] = str(system.name)
+
+        if kind == LocationKind.SYSTEM:
+            # Локация-система: поиск контрактов по всем локациям выдачи системы (§6.12).
+            cleaned["name"] = str(system.name)
+            cleaned["station_id"] = None
+            cleaned["structure_id"] = None
+            if MarketLocation.objects.filter(kind=LocationKind.SYSTEM, solar_system_id=system_id).exists():
+                raise forms.ValidationError(_("This system is already monitored."))
+        elif kind == LocationKind.STATION:
             station_id = cleaned.get("station_id")
             if not station_id:
                 raise forms.ValidationError(_("Station is required for a station location."))
             station = EveStation.objects.filter(pk=station_id).first()
             if station is None:
-                raise forms.ValidationError(_("Unknown station (not found in SDE)."))
+                # structure_id не бывает в SDE-справочнике станций: подсказываем
+                # переключить Kind на structure (§9 — структуры ищутся через ESI).
+                raise forms.ValidationError(
+                    _(
+                        "Unknown station (not found in SDE). "
+                        "Corporation structures must be added with kind 'structure' via the structure search."
+                    )
+                )
             cleaned["name"] = str(station.name)
             if MarketLocation.objects.filter(kind=LocationKind.STATION, station_id=station_id).exists():
                 raise forms.ValidationError(_("This station is already monitored."))
@@ -239,36 +303,6 @@ class MarketLocationForm(forms.Form):
 # Настройки (§10) + webhook + провайдеры (§14)
 # ---------------------------------------------------------------------------
 
-SETTING_EXCLUDED_FIELDS = ["webhook_url"]
-
-
-class PluginSettingForm(forms.ModelForm):
-    """Форма настроек плагина по §10; webhook_url не входит (показывается только с правом _edit, §16)."""
-
-    class Meta:
-        model = PluginSetting
-        exclude = ["webhook_url"]
-        widgets = {
-            field: forms.NumberInput(attrs={"class": "form-control"})
-            for field in [
-                "jita_markup_pct",
-                "overprice_threshold_pct",
-                "delivery_rate_isk_per_m3",
-                "jita_region_id",
-                "jita_station_id",
-                "jita_book_depth",
-                "jita_type_batch",
-                "jita_sync_interval_min",
-                "stock_sync_interval_min",
-                "contracts_sync_interval_min",
-                "data_stale_after_min",
-                "provider_acl_cooldown_min",
-                "provider_acl_max_failures",
-                "notification_deficit_cooldown_min",
-            ]
-        }
-
-
 class WebhookForm(forms.ModelForm):
     """Форма Discord webhook (§13); доступна только пользователям с правом _edit (§16).
 
@@ -289,23 +323,6 @@ class WebhookForm(forms.ModelForm):
         widgets = {
             "enabled": forms.CheckboxInput(),
         }
-
-
-class ProviderAddForm(forms.Form):
-    """Привязка провайдера: персонаж AA с нужными ESI-скоупами (§9.1, §11)."""
-
-    character = forms.ModelChoiceField(
-        label=_("Character"),
-        queryset=None,
-        widget=forms.Select(attrs={"class": "form-control"}),
-    )
-
-    def __init__(self, *args, **kwargs):
-        """Список персонажей — из справочника AA (eveonline), токены не хранятся (§8)."""
-        from allianceauth.eveonline.models import EveCharacter
-
-        super().__init__(*args, **kwargs)
-        self.fields["character"].queryset = EveCharacter.objects.all().order_by("character_name")
 
 
 class ContractProviderAddForm(forms.Form):

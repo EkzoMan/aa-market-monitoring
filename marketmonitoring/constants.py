@@ -15,10 +15,15 @@ class SyncStatus(models.TextChoices):
 
 
 class LocationKind(models.TextChoices):
-    """Вид локации мониторинга (§8 MarketLocation.kind)."""
+    """Вид локации мониторинга (§8 MarketLocation.kind).
+
+    SYSTEM — локация-система: расширяет область поиска контрактов (§6.12)
+    всеми локациями выдачи системы, если система входит в область фита.
+    """
 
     STATION = "station", _("station")
     STRUCTURE = "structure", _("structure")
+    SYSTEM = "system", _("system")
 
 
 class ScopeKind(models.TextChoices):

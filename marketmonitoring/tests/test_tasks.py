@@ -12,12 +12,20 @@ from types import SimpleNamespace
 from unittest import mock
 
 import pytest
+from allianceauth.eveonline.models import EveCharacter
 from django.utils import timezone
 
 from .. import tasks
 from ..calc.service import recalc_fit
-from ..constants import LocationKind, SyncRunStatus, SyncStatus, TriggerKind
+from ..constants import (
+    ContractSourceKind,
+    LocationKind,
+    SyncRunStatus,
+    SyncStatus,
+    TriggerKind,
+)
 from ..models import (
+    ContractProvider,
     Fit,
     FitComponent,
     JitaOrderLevel,
@@ -276,3 +284,106 @@ def test_notify_deficit_fit_status_deficit(eve_types, webhook_row, db):  # noqa:
     assert fit.status_cache == "deficit"
     assert fit.total_cost is not None
     assert NotificationLog.objects.count() == 0
+
+
+# --- sync_corp_structures (решение №37 §20) --------------------------------
+
+STRUCTURE_ID = 1048576000001
+
+
+@pytest.fixture
+def corp_contract_provider(db):
+    """Персонаж AA + включённый corporation ContractProvider для синка структур."""
+    eve_char = EveCharacter.objects.create(
+        character_id=9001,
+        character_name="Structure Pilot",
+        corporation_id=9002,
+        corporation_name="Corp",
+        corporation_ticker="CRP",
+    )
+    return ContractProvider.objects.create(
+        character=eve_char,
+        source_kind=ContractSourceKind.CORPORATION,
+        enabled=True,
+        priority=10,
+        sync_status=SyncStatus.OK,
+    )
+
+
+def test_sync_corp_structures_registers_new_structures_disabled(corp_contract_provider):
+    """Новые структуры корпорации регистрируются как MarketLocation(enabled=false) — решение №37."""
+    structures = [
+        {"structure_id": STRUCTURE_ID, "name": "Fort Knocks", "solar_system_id": SYSTEM_ID},
+    ]
+    with mock.patch.object(tasks.esi_client, "fetch_corporation_structures", return_value=(structures, False)) as fetch:
+        result = tasks.sync_corp_structures(trigger="manual")
+
+    fetch.assert_called_once_with(9002, 9001)
+    assert result["ok"] is True
+    assert result["structures"] == 1
+    location = MarketLocation.objects.get(structure_id=STRUCTURE_ID)
+    assert location.kind == LocationKind.STRUCTURE
+    # Решение №37 §20: новые структуры создаются выключенными.
+    assert location.enabled is False
+    assert location.name == "Fort Knocks"
+    assert location.solar_system_id == SYSTEM_ID
+
+
+def test_sync_corp_structures_idempotent_and_fills_placeholder(corp_contract_provider):
+    """Повторный синк не дублирует записи; плейсхолдерное имя и пустые координаты заполняются."""
+    MarketLocation.objects.create(
+        name=f"Structure {STRUCTURE_ID}",
+        kind=LocationKind.STRUCTURE,
+        structure_id=STRUCTURE_ID,
+        solar_system_id=0,
+        region_id=0,
+        enabled=True,
+    )
+    structures = [
+        {"structure_id": STRUCTURE_ID, "name": "Fort Knocks", "solar_system_id": SYSTEM_ID},
+    ]
+    with mock.patch.object(tasks.esi_client, "fetch_corporation_structures", return_value=(structures, False)):
+        tasks.sync_corp_structures(trigger="manual")
+        tasks.sync_corp_structures(trigger="manual")
+
+    assert MarketLocation.objects.filter(kind=LocationKind.STRUCTURE).count() == 1
+    location = MarketLocation.objects.get(structure_id=STRUCTURE_ID)
+    assert location.name == "Fort Knocks"
+    assert location.solar_system_id == SYSTEM_ID
+    # Включённая вручную запись не отключается синком (существующие не трогаем).
+    assert location.enabled is True
+
+
+def test_sync_corp_structures_guard_interval(corp_contract_provider):
+    """Beat-запуск чаще guard-интервала 1440 мин пропускается (§12.2, решение №37)."""
+    now = timezone.now()
+    SyncRun.objects.create(
+        task_name="marketmonitoring.sync_corp_structures",
+        trigger=TriggerKind.BEAT,
+        started_at=now,
+        finished_at=now,
+        status=SyncRunStatus.OK,
+    )
+    with mock.patch.object(tasks.esi_client, "fetch_corporation_structures") as fetch:
+        result = tasks.sync_corp_structures(trigger="beat")
+    fetch.assert_not_called()
+    assert result == {"skipped": True}
+
+
+def test_sync_corp_structures_acl_failure_marks_provider(corp_contract_provider, webhook_row):
+    """403/401 при списке структур — cooldown провайдера и запись об ошибке (§11)."""
+    from esi.exceptions import HTTPClientError
+
+    exc = HTTPClientError(status_code=403, headers={}, data=None)
+    with (
+        mock.patch.object(tasks.esi_client, "fetch_corporation_structures", side_effect=exc),
+        mock.patch("marketmonitoring.notify.discord.requests.post", side_effect=_http_ok),
+    ):
+        result = tasks.sync_corp_structures(trigger="manual")
+
+    assert result["ok"] is True
+    assert result["providers_failed"] == 1
+    corp_contract_provider.refresh_from_db()
+    assert corp_contract_provider.sync_status == SyncStatus.NO_ACL
+    run = SyncRun.objects.filter(task_name="marketmonitoring.sync_corp_structures").order_by("-pk").first()
+    assert "ACL 403" in run.errors

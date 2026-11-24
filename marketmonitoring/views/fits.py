@@ -13,7 +13,7 @@ from django.urls import reverse
 from django.utils.translation import gettext as _
 
 from ..auth_hooks import has_edit, has_view
-from ..constants import FitStatus
+from ..constants import FitStatus, ScopeKind
 from ..eft.parser import parse_eft
 from ..forms import FitComponentRowForm, FitForm
 from ..models import Fit, FitComponent
@@ -312,6 +312,38 @@ def _process_fit_post(request, form: FitForm, fit: Fit | None = None):
     }
 
 
+def _scope_ref_display_name(scope_kind: str, scope_ref: int | None) -> str:
+    """Человекочитаемое имя области из SDE для поля поиска (station/system/region)."""
+    from eveuniverse.models import EveRegion, EveSolarSystem, EveStation
+
+    if not scope_kind or not scope_ref:
+        return ""
+    model = {
+        ScopeKind.STATION: EveStation,
+        ScopeKind.SYSTEM: EveSolarSystem,
+        ScopeKind.REGION: EveRegion,
+    }.get(scope_kind)
+    if model is None:
+        return ""
+    name = model.objects.filter(pk=scope_ref).values_list("name", flat=True).first()
+    return str(name) if name else ""
+
+
+def _with_scope_ref_name(form: FitForm, fit: Fit | None) -> FitForm:
+    """Заполняет scope_ref_name формы значением из SDE (GET и POST без имени)."""
+    if form.instance and form.instance.scope_ref and not form.data.get("scope_ref_name"):
+        form.fields["scope_ref_name"].initial = _scope_ref_display_name(
+            form.instance.scope_kind, form.instance.scope_ref
+        )
+    elif not form.data.get("scope_ref_name"):
+        scope_ref = (form.data or {}).get("scope_ref")
+        if scope_ref:
+            form.fields["scope_ref_name"].initial = _scope_ref_display_name(
+                (form.data or {}).get("scope_kind"), int(scope_ref)
+            )
+    return form
+
+
 @login_required
 def fit_create(request):
     """Создание фита: POST action=parse -> предпросмотр с правками состава (§7.5)."""
@@ -324,6 +356,7 @@ def fit_create(request):
     if response is not None:
         return response
 
+    context["form"] = _with_scope_ref_name(context["form"], None)
     context.update({"page_title": _("Add fit")})
     return render(request, "marketmonitoring/fit_form.html", context)
 
@@ -341,6 +374,7 @@ def fit_update(request, fit_id: int):
     if response is not None:
         return response
 
+    context["form"] = _with_scope_ref_name(context["form"], fit)
     context.update({"page_title": _("Edit fit"), "fit": fit})
     return render(request, "marketmonitoring/fit_form.html", context)
 

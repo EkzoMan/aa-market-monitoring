@@ -11,7 +11,7 @@ import pytest
 from django.utils import timezone
 
 from .. import tasks
-from ..constants import SourceKind, SyncRunStatus, TriggerKind
+from ..constants import LocationKind, SourceKind, SyncRunStatus, SyncStatus, TriggerKind
 from ..esi import client as esi_client
 from ..models import (
     JitaOrderLevel,
@@ -400,6 +400,80 @@ def test_sync_region_orders_triggers_recalc_and_stock_level(settings_row):
     assert level.total_sell_volume == 42
     run = SyncRun.objects.filter(task_name="marketmonitoring.recalc_stock_levels").latest("started_at")
     assert run.status == SyncRunStatus.OK
+
+
+@pytest.mark.django_db
+def test_sync_region_orders_marks_station_sync_status(settings_row):
+    """Успех регионального синка переводит NPC-станции региона в sync_status=ok
+    с обновлением last_synced_at (§8 MarketLocation.sync_status), сбой — в error."""
+    station = MarketLocation.objects.create(
+        name="Jita IV-4",
+        kind=LocationKind.STATION,
+        station_id=60003760,
+        solar_system_id=30000142,
+        region_id=settings_row.jita_region_id,
+        enabled=True,
+    )
+    structure = MarketLocation.objects.create(
+        name="Fort",
+        kind=LocationKind.STRUCTURE,
+        structure_id=1022735589923,
+        solar_system_id=30000142,
+        region_id=settings_row.jita_region_id,
+        enabled=True,
+    )
+    with mock.patch.object(esi_client, "fetch_region_orders") as fetch:
+        fetch.return_value = ([_order(type_id=34, price=7.0, volume=1)], False)
+        tasks.sync_region_orders(trigger=TriggerKind.MANUAL)
+    station.refresh_from_db()
+    assert station.sync_status == SyncStatus.OK
+    assert station.last_synced_at is not None
+    # Структуры не затрагиваются региональным синком (структурный синк — отдельная задача).
+    structure.refresh_from_db()
+    assert structure.sync_status == SyncStatus.STALE
+
+    with mock.patch.object(esi_client, "fetch_region_orders") as fetch:
+        fetch.side_effect = RuntimeError("boom")
+        tasks.sync_region_orders(trigger=TriggerKind.MANUAL)
+    station.refresh_from_db()
+    assert station.sync_status == SyncStatus.ERROR
+
+
+@pytest.mark.django_db
+def test_sync_region_orders_marks_station_sync_status(settings_row):
+    """Успех регионального синка переводит NPC-станции региона в sync_status=ok
+    с обновлением last_synced_at (§8 MarketLocation.sync_status), сбой — в error."""
+    station = MarketLocation.objects.create(
+        name="Jita IV-4",
+        kind=LocationKind.STATION,
+        station_id=60003760,
+        solar_system_id=30000142,
+        region_id=settings_row.jita_region_id,
+        enabled=True,
+    )
+    structure = MarketLocation.objects.create(
+        name="Fort",
+        kind=LocationKind.STRUCTURE,
+        structure_id=1022735589923,
+        solar_system_id=30000142,
+        region_id=settings_row.jita_region_id,
+        enabled=True,
+    )
+    with mock.patch.object(esi_client, "fetch_region_orders") as fetch:
+        fetch.return_value = ([_order(type_id=34, price=7.0, volume=1)], False)
+        tasks.sync_region_orders(trigger=TriggerKind.MANUAL)
+    station.refresh_from_db()
+    assert station.sync_status == SyncStatus.OK
+    assert station.last_synced_at is not None
+    # Структуры не затрагиваются региональным синком (структурный синк — отдельная задача).
+    structure.refresh_from_db()
+    assert structure.sync_status == SyncStatus.STALE
+
+    with mock.patch.object(esi_client, "fetch_region_orders") as fetch:
+        fetch.side_effect = RuntimeError("boom")
+        tasks.sync_region_orders(trigger=TriggerKind.MANUAL)
+    station.refresh_from_db()
+    assert station.sync_status == SyncStatus.ERROR
 
 
 @pytest.mark.django_db

@@ -7,6 +7,7 @@
 import logging
 from datetime import timedelta
 from decimal import ROUND_HALF_UP, Decimal
+from typing import Any
 
 from celery import shared_task
 from django.core.cache import cache
@@ -54,6 +55,9 @@ SEARCH_RESULT_TTL_SECONDS = 300
 CLEANUP_INTERVAL_HOURS = 24
 VERIFY_PROVIDERS_INTERVAL_MIN = 60
 
+# Guard-интервал синка структур корпораций (решение №37 §20): раз в сутки.
+CORP_STRUCTURES_SYNC_INTERVAL_MIN = 1440
+
 # Beat-интервалы (§12.2): sync_*/verify_providers каждые 5 минут, cleanup ежедневно.
 BEAT_SYNC_INTERVAL_SECONDS = 300
 BEAT_CLEANUP_INTERVAL_SECONDS = 86400
@@ -62,33 +66,33 @@ BEAT_CLEANUP_INTERVAL_SECONDS = 86400
 def build_beat_schedule() -> dict:
     """Фабрика beat-расписания (§12.2) — для документации и конфигурации Celery beat.
 
-    Каждые 5 минут: sync_jita_book, sync_region_orders, sync_structure_orders,
-    verify_providers (и notify_deficit — уведомления о дефиците только при
-    trigger=beat, §12.4). Ежедневно: cleanup_orphan_cache. Фактические интервалы
-    выполнения проверяются guard'ами задач (§10, §12.2): guard-интервалы
-    CLEANUP_INTERVAL_HOURS / VERIFY_PROVIDERS_INTERVAL_MIN и интервалы настроек
-    jita_sync_interval_min / stock_sync_interval_min не позволят задаче выполниться
-    чаще, чем разрешено, даже при более частом beat-тике.
+    Каждые 5 минут: sync_contracts, verify_providers (и notify_deficit —
+    уведомления о дефиците только при trigger=beat, §12.4). Ежедневно:
+    cleanup_orphan_cache. Фактические интервалы выполнения проверяются
+    guard'ами задач (§10, §12.2): guard-интервалы CLEANUP_INTERVAL_HOURS /
+    VERIFY_PROVIDERS_INTERVAL_MIN и contracts_sync_interval_min не позволят
+    задаче выполниться чаще, чем разрешено, даже при более частом beat-тике.
+
+    Рыночные синки sync_jita_book / sync_region_orders / sync_structure_orders
+    временно отключены (задачи сохранены, запускаются только напрямую).
     """
     every_five_minutes = {
         "schedule": BEAT_SYNC_INTERVAL_SECONDS,
         "options": {"trigger": TriggerKind.BEAT},
     }
     return {
-        "marketmonitoring-sync-jita-book": {**every_five_minutes, "task": "marketmonitoring.sync_jita_book"},
-        "marketmonitoring-sync-region-orders": {**every_five_minutes, "task": "marketmonitoring.sync_region_orders"},
-        "marketmonitoring-sync-structure-orders": {
-            **every_five_minutes,
-            "task": "marketmonitoring.sync_structure_orders",
-        },
-        "marketmonitoring-sync-contracts": {
-            **every_five_minutes,
-            "task": "marketmonitoring.sync_contracts",
-        },
+        "marketmonitoring-sync-contracts": {**every_five_minutes, "task": "marketmonitoring.sync_contracts"},
         "marketmonitoring-verify-providers": every_five_minutes | {"task": "marketmonitoring.verify_providers"},
         "marketmonitoring-notify-deficit": every_five_minutes | {"task": "marketmonitoring.notify_deficit"},
         "marketmonitoring-cleanup-orphan-cache": {
             "task": "marketmonitoring.cleanup_orphan_cache",
+            "schedule": BEAT_CLEANUP_INTERVAL_SECONDS,
+            "options": {"trigger": TriggerKind.BEAT},
+        },
+        # Структуры корпораций провайдеров (решение №37 §20): раз в сутки.
+        # Guard CORP_STRUCTURES_SYNC_INTERVAL_MIN не даст выполниться чаще.
+        "marketmonitoring-sync-corp-structures": {
+            "task": "marketmonitoring.sync_corp_structures",
             "schedule": BEAT_CLEANUP_INTERVAL_SECONDS,
             "options": {"trigger": TriggerKind.BEAT},
         },
@@ -199,6 +203,22 @@ def _replace_source_cache(source_kind: str, source_ref: int, rows: list[dict]) -
         objs = [MarketOrderCache(**row) for row in rows]
         MarketOrderCache.objects.bulk_create(objs, batch_size=2000)
         return len(objs)
+
+
+def _mark_region_stations(region_id: int, status: str) -> int:
+    """Обновление sync_status NPC-станций региона после регионального синка (§8).
+
+    NPC-станции получают данные из регионального кэша заказов, поэтому их
+    sync_status/last_synced_at отражают результат синка региона: успех — ok,
+    сбой/частичность — error. Один запрос .update() — без N+1. Структуры
+    и локации-системы не затрагиваются (структуры синкаются структурным
+    синком, системы не имеют своих рыночных данных).
+    """
+    now = timezone.now()
+    qs = MarketLocation.objects.filter(kind=LocationKind.STATION, region_id=region_id)
+    if status == SyncStatus.OK:
+        return qs.update(sync_status=SyncStatus.OK, last_synced_at=now)
+    return qs.update(sync_status=status)
 
 
 def _replace_jita_levels(type_ids: list[int], orders: list) -> int:
@@ -398,11 +418,16 @@ def sync_region_orders(
                 partial_any = partial_any or partial
                 rows = esi_client.build_order_cache_rows(orders, source_kind=SourceKind.REGION, source_ref=rid)
                 items += _replace_source_cache(SourceKind.REGION, rid, rows)
+                # NPC-станции региона получают данные из регионального кэша:
+                # успех региона — их sync_status=ok и свежий last_synced_at
+                # (иначе чип навсегда остаётся stale, §8 MarketLocation.sync_status).
+                _mark_region_stations(rid, SyncStatus.OK if not partial else SyncStatus.ERROR)
                 ok += 1
             except Exception as exc:  # noqa: BLE001 — сбой одного региона не прерывает задачу (§9.5)
                 failed += 1
                 errors.append(f"region {rid}: {exc}")
                 logger.warning("Region %s sync failed: %s", rid, exc)
+                _mark_region_stations(rid, SyncStatus.ERROR)
         _finish_run(
             run,
             status=(
@@ -561,21 +586,20 @@ def _upsert_contracts_source(
     source_ref: int,
     active_rows: list[dict],
     fetched_items_by_cid: dict[int, list],
-    partial: bool,
-) -> int:
-    """Атомарное обновление ContractCache/ContractItemCache по источнику (§6.12, §12.5).
+) -> tuple[int, set[int]]:
+    """Атомарная запись ContractCache/ContractItemCache по источнику (§6.12, §12.5).
 
-    При полном срезе (``partial=False``) удаляет контракты этого источника, которые
-    перестали быть ``outstanding``/``item_exchange`` или истекли. Позиции ``items``
-    вставляются один раз при первой загрузке ``contract_id`` (решение №35).
+    Удаление исчезнувших контрактов здесь НЕ выполняется: зачистка делается один
+    раз в конце прогона sync_contracts по объединённому active-множеству всех
+    источников (решение №38 §20 — кросс-эндпоинтовый контракт, видимый сразу в
+    корпоративном и персонажном срезах, не должен удаляться при синке одного
+    источника). Позиции ``items`` вставляются один раз при первой загрузке
+    ``contract_id`` (решение №35). Возвращает (число обработанных строк,
+    активные contract_id источника).
     """
     active_cids = {row["contract_id"] for row in active_rows}
     processed = 0
     with transaction.atomic():
-        if not partial:
-            ContractCache.objects.filter(source_kind=source_kind, source_ref=source_ref).exclude(
-                contract_id__in=active_cids
-            ).delete()
         existing = {c.contract_id: c for c in ContractCache.objects.filter(contract_id__in=active_cids)}
         existing_with_items = set(
             ContractItemCache.objects.filter(contract__contract_id__in=active_cids)
@@ -605,7 +629,7 @@ def _upsert_contracts_source(
                 existing_with_items.add(cid)
         if new_item_objs:
             ContractItemCache.objects.bulk_create(new_item_objs, batch_size=2000)
-    return processed
+    return processed, active_cids
 
 
 @shared_task(bind=True, name="marketmonitoring.sync_contracts")
@@ -640,6 +664,11 @@ def sync_contracts(self, trigger: str = TriggerKind.BEAT, lock_token: str | None
         # Очистка глобально истёкших контрактов до обхода провайдеров.
         ContractCache.objects.filter(date_expired__lte=timezone.now()).delete()
         seen_sources: set[tuple[str, int]] = set()
+        # Решение №38 §20: активные contract_id всех источников прогона —
+        # финальная зачистка выполняется один раз после обхода всех провайдеров,
+        # чтобы кросс-эндпоинтовый контракт не удалился синком одного источника.
+        active_cids_global: set[int] = set()
+        full_run_sources: list[tuple[str, int]] = []
         for provider in providers:
             char_id = provider.character.character_id
             if provider.source_kind == ContractSourceKind.CORPORATION:
@@ -727,19 +756,33 @@ def sync_contracts(self, trigger: str = TriggerKind.BEAT, lock_token: str | None
             provider_service.handle_contract_provider_success(provider)
             provider_partial = partial or items_partial
             partial_any = partial_any or provider_partial
-            items_processed += _upsert_contracts_source(
+            processed_rows, source_active_cids = _upsert_contracts_source(
                 source_kind=source_key[0],
                 source_ref=source_key[1],
                 active_rows=active_rows,
                 fetched_items_by_cid=fetched_items_by_cid,
-                partial=provider_partial,
             )
+            items_processed += processed_rows
+            active_cids_global |= source_active_cids
             provider.sync_status = SyncStatus.OK if not provider_partial else SyncStatus.ERROR
             provider.last_synced_at = timezone.now()
             provider.save(update_fields=["sync_status", "last_synced_at"])
             if not provider_partial:
                 seen_sources.add(source_key)
+                # Полный срез источника — по нему можно безопасно чистить исчезнувшие контракты.
+                full_run_sources.append(source_key)
             ok += 1
+
+        # Решение №38 §20: финальная зачистка исчезнувших контрактов — один раз после
+        # обхода всех провайдеров, по объединённому active-множеству прогона. Контракт,
+        # активный хотя бы в одном источнике (например, виден и в корпоративном, и в
+        # персонажном срезе), не удаляется. Зачистка выполняется только для источников
+        # с полным срезом; частичные (partial) источники не чистятся (§12.5).
+        with transaction.atomic():
+            for source_kind, source_ref in full_run_sources:
+                ContractCache.objects.filter(source_kind=source_kind, source_ref=source_ref).exclude(
+                    contract_id__in=active_cids_global
+                ).delete()
 
         _finish_run(
             run,
@@ -759,6 +802,148 @@ def sync_contracts(self, trigger: str = TriggerKind.BEAT, lock_token: str | None
         logger.exception("sync_contracts failed")
         _finish_run(run, status=SyncRunStatus.FAILED, errors=str(exc))
         return {"ok": False, "error": str(exc)}
+
+
+@shared_task(bind=True, name="marketmonitoring.sync_corp_structures")
+def sync_corp_structures(self, trigger: str = TriggerKind.BEAT) -> dict:
+    """Синк структур корпораций провайдеров контрактов (решение №37 §20).
+
+    Для каждого включённого ``ContractProvider`` (corporation) тянет список
+    структур его корпорации (``GET /corporations/{id}/structures/``, скоуп
+    ``esi-corporations.read_corporation_structures.v1``) и регистрирует
+    незнакомые структуры в ``MarketLocation(kind=structure, enabled=False)``
+    — включаются вручную в Locations UI (решение №37). Существующие записи
+    не трогаются, кроме заполнения пустого ``solar_system_id``/``region_id``
+    и плейсхолдерного имени. Guard-интервал — раз в сутки. ACL-сбой
+    провайдера обрабатывается как в sync_contracts (cooldown/отключение §11).
+    """
+    from esi.exceptions import HTTPClientError
+
+    from .providers import service as provider_service
+
+    last = (
+        SyncRun.objects.filter(task_name="marketmonitoring.sync_corp_structures", trigger=TriggerKind.BEAT)
+        .order_by("-started_at")
+        .values_list("started_at", flat=True)
+        .first()
+    )
+    if trigger == TriggerKind.BEAT and not _interval_expired(last, CORP_STRUCTURES_SYNC_INTERVAL_MIN):
+        return {"skipped": True}
+    run = _start_run("marketmonitoring.sync_corp_structures", trigger)
+    providers = list(provider_service.available_contract_providers())
+    ok = failed = items_processed = 0
+    errors: list[str] = []
+    partial_any = False
+    try:
+        seen_corps: set[int] = set()
+        for provider in providers:
+            char_id = provider.character.character_id
+            if provider.source_kind != ContractSourceKind.CORPORATION:
+                continue
+            corp_id = provider.character.corporation_id
+            if not corp_id:
+                continue
+            if int(corp_id) in seen_corps:
+                continue
+            seen_corps.add(int(corp_id))
+            try:
+                structures, partial = esi_client.fetch_corporation_structures(int(corp_id), char_id)
+            except HTTPClientError as exc:
+                status_code = getattr(exc, "status_code", None)
+                if status_code in (401, 403):
+                    provider_service.handle_contract_provider_acl_failure(provider)
+                    provider.sync_status = SyncStatus.NO_ACL
+                    provider.save(update_fields=["sync_status"])
+                    failed += 1
+                    errors.append(f"corp structures provider {char_id}: ACL {status_code}")
+                    continue
+                failed += 1
+                errors.append(f"corp structures provider {char_id}: HTTP {status_code}: {exc}")
+                logger.warning("Corp structures sync via provider %s failed: %s", char_id, exc)
+                continue
+            except ValueError as exc:
+                failed += 1
+                errors.append(f"corp structures provider {char_id}: {exc}")
+                logger.warning("Corp structures provider %s has no valid token: %s", char_id, exc)
+                continue
+            partial_any = partial_any or partial
+            # Регионы систем структур — одним пакетным запросом из SDE (§8, без ESI).
+            system_ids = {
+                int(sys_id)
+                for sys_id in (_structure_field(row, "solar_system_id") for row in structures)
+                if sys_id is not None
+            }
+            region_by_system: dict[int, int | None] = {}
+            if system_ids:
+                from eveuniverse.models import EveSolarSystem
+
+                region_by_system = dict(
+                    EveSolarSystem.objects.filter(pk__in=system_ids).values_list(
+                        "pk", "eve_constellation__eve_region_id"
+                    )
+                )
+            for row in structures:
+                structure_id = _structure_field(row, "structure_id")
+                if structure_id is None:
+                    continue
+                structure_id = int(structure_id)
+                name = str(_structure_field(row, "name") or f"Structure {structure_id}")
+                solar_system_id = _structure_field(row, "solar_system_id")
+                solar_system_id = int(solar_system_id) if solar_system_id is not None else None
+                region_id = region_by_system.get(solar_system_id) if solar_system_id is not None else None
+                location = MarketLocation.objects.filter(kind=LocationKind.STRUCTURE, structure_id=structure_id).first()
+                if location is None:
+                    MarketLocation.objects.create(
+                        name=name,
+                        kind=LocationKind.STRUCTURE,
+                        structure_id=structure_id,
+                        solar_system_id=solar_system_id or 0,
+                        region_id=region_id or 0,
+                        # Решение №37 §20: новые структуры регистрируются выключенными.
+                        enabled=False,
+                    )
+                    items_processed += 1
+                else:
+                    # Существующие записи не трогаем, кроме незаполненных координат
+                    # и плейсхолдерного имени (реальное имя подтягивается из ESI-синка).
+                    update_fields = []
+                    if (not location.solar_system_id) and solar_system_id:
+                        location.solar_system_id = solar_system_id
+                        update_fields.append("solar_system_id")
+                    if (not location.region_id) and region_id:
+                        location.region_id = region_id
+                        update_fields.append("region_id")
+                    if location.name == f"Structure {structure_id}" and name != location.name:
+                        location.name = name
+                        update_fields.append("name")
+                    if update_fields:
+                        location.save(update_fields=update_fields)
+            provider_service.handle_contract_provider_success(provider)
+            ok += 1
+        _finish_run(
+            run,
+            status=(
+                SyncRunStatus.FAILED
+                if failed and not ok
+                else SyncRunStatus.PARTIAL if (failed or partial_any) else SyncRunStatus.OK
+            ),
+            locations_ok=ok,
+            locations_failed=failed,
+            items_processed=items_processed,
+            errors="\n".join(errors),
+        )
+        return {"ok": True, "providers_ok": ok, "providers_failed": failed, "structures": items_processed}
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("sync_corp_structures failed")
+        _finish_run(run, status=SyncRunStatus.FAILED, errors=str(exc))
+        return {"ok": False, "error": str(exc)}
+
+
+def _structure_field(row: Any, name: str, default: Any = None) -> Any:
+    """Чтение поля структуры ESI: dict или pydantic-модель (как _order_field)."""
+    if isinstance(row, dict):
+        return row.get(name, default)
+    return getattr(row, name, default)
 
 
 @shared_task(bind=True, name="marketmonitoring.recalc_stock_levels")

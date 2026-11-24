@@ -7,6 +7,8 @@ from django.urls import reverse
 
 from ..auth_hooks import GROUP_EDIT, GROUP_VIEW
 from ..models import Fit, FitComponent
+from .test_calc_engine import sde_ids  # noqa: F401 — справочник eveuniverse (система 30000142)
+from .test_calc_engine import sde_ids  # noqa: F401 — справочник eveuniverse (система 30000142)
 from .test_eft_parser import eve_types  # noqa: F401 — фикстура EveType записей
 
 pytestmark = pytest.mark.django_db
@@ -42,7 +44,7 @@ def _post_save(client, scope_ref: int = 30000142):
     )
 
 
-def test_fit_save_includes_hull_component(eve_types, editor_client):  # noqa: F811
+def test_fit_save_includes_hull_component(eve_types, sde_ids, editor_client):  # noqa: F811
     """При сохранении корпус попадает в FitComponent как позиция qty=1, is_charge=False (§6.3)."""
     response = _post_save(editor_client)
     assert response.status_code == 302
@@ -52,7 +54,7 @@ def test_fit_save_includes_hull_component(eve_types, editor_client):  # noqa: F8
     assert hull.is_charge is False
 
 
-def test_fit_save_components(eve_types, editor_client):  # noqa: F811
+def test_fit_save_components(eve_types, sde_ids, editor_client):  # noqa: F811
     """Состав сохраняется по позициям с учётом дубликатов (§7.3.7)."""
     _post_save(editor_client)
     fit = Fit.objects.get(name="Save test")
@@ -61,7 +63,7 @@ def test_fit_save_components(eve_types, editor_client):  # noqa: F811
     assert mfs.qty_per_fit == 2
 
 
-def test_fit_update_rewrites_components(eve_types, editor_client):  # noqa: F811
+def test_fit_update_rewrites_components(eve_types, sde_ids, editor_client):  # noqa: F811
     """Правка фита идемпотентно перезаписывает состав, корпус сохраняется (§14)."""
     _post_save(editor_client)
     fit = Fit.objects.get(name="Save test")

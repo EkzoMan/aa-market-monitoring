@@ -36,15 +36,25 @@ def locations(request):
     form = MarketLocationForm(request.POST or None)
     if request.method == "POST" and form.is_valid():
         cleaned = form.cleaned_data
-        MarketLocation.objects.create(
-            name=cleaned["name"],
-            kind=cleaned["kind"],
-            station_id=cleaned.get("station_id"),
-            structure_id=cleaned.get("structure_id"),
-            solar_system_id=cleaned["solar_system_id"],
-            region_id=cleaned["region_id_resolved"],
-            sync_status=SyncStatus.STALE,
-        )
+        if cleaned["kind"] == LocationKind.SYSTEM:
+            # Локация-система: station_id/structure_id не заполняются.
+            MarketLocation.objects.create(
+                name=cleaned["name"],
+                kind=LocationKind.SYSTEM,
+                solar_system_id=cleaned["solar_system_id"],
+                region_id=cleaned["region_id_resolved"],
+                sync_status=SyncStatus.OK,
+            )
+        else:
+            MarketLocation.objects.create(
+                name=cleaned["name"],
+                kind=cleaned["kind"],
+                station_id=cleaned.get("station_id"),
+                structure_id=cleaned.get("structure_id"),
+                solar_system_id=cleaned["solar_system_id"],
+                region_id=cleaned["region_id_resolved"],
+                sync_status=SyncStatus.STALE,
+            )
         messages.success(request, _("Location added."))
         return redirect("marketmonitoring:locations")
 
@@ -54,6 +64,7 @@ def locations(request):
         "form": form,
         "kind_station": LocationKind.STATION,
         "kind_structure": LocationKind.STRUCTURE,
+        "kind_system": LocationKind.SYSTEM,
     }
     return render(request, "marketmonitoring/locations.html", context)
 
@@ -127,6 +138,36 @@ def station_search(request):
     if system_id and system_id.isdigit():
         qs = qs.filter(eve_solar_system_id=int(system_id))
     rows = qs.order_by("name").values("id", "name")[:20]
+    return JsonResponse({"results": [{"id": row["id"], "name": row["name"]} for row in rows]})
+
+
+@login_required
+def region_search(request):
+    """JSON-поиск регионов SDE для редактора фитов (edit); лимит 20."""
+    if not has_edit(request.user):
+        return JsonResponse({"results": [], "error": "permission denied"}, status=403)
+
+    from eveuniverse.models import EveRegion
+
+    query = (request.GET.get("q") or "").strip()
+    if len(query) < 2:
+        return JsonResponse({"results": []})
+    rows = EveRegion.objects.filter(name__icontains=query).order_by("name").values("id", "name")[:20]
+    return JsonResponse({"results": [{"id": row["id"], "name": row["name"]} for row in rows]})
+
+
+@login_required
+def region_search(request):
+    """JSON-поиск регионов SDE для редактора фитов (edit); лимит 20."""
+    if not has_edit(request.user):
+        return JsonResponse({"results": [], "error": "permission denied"}, status=403)
+
+    from eveuniverse.models import EveRegion
+
+    query = (request.GET.get("q") or "").strip()
+    if len(query) < 2:
+        return JsonResponse({"results": []})
+    rows = EveRegion.objects.filter(name__icontains=query).order_by("name").values("id", "name")[:20]
     return JsonResponse({"results": [{"id": row["id"], "name": row["name"]} for row in rows]})
 
 

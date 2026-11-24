@@ -36,6 +36,12 @@ SCOPE_SEARCH_STRUCTURES = "esi-search.search_structures.v1"
 SCOPE_CORP_CONTRACTS = "esi-contracts.read_corporation_contracts.v1"
 SCOPE_CHAR_CONTRACTS = "esi-contracts.read_character_contracts.v1"
 
+# Скоуп списка структур корпорации провайдера (решение №37 §20).
+SCOPE_CORP_STRUCTURES = "esi-corporations.read_corporation_structures.v1"
+
+# Скоуп списка структур корпорации провайдера (решение №37 §20).
+SCOPE_CORP_STRUCTURES = "esi-corporations.read_corporation_structures.v1"
+
 # Порог заголовка X-ESI-Error-Limit-Remain (§9.2).
 ERROR_LIMIT_REMAIN_THRESHOLD = 10
 
@@ -53,6 +59,7 @@ ESI_OPERATIONS = [
     "GetCorporationsCorporationIdContractsContractIdItems",
     "GetCharactersCharacterIdContracts",
     "GetCharactersCharacterIdContractsContractIdItems",
+    "GetCorporationsCorporationIdStructures",
 ]
 
 # Собственный провайдер django-esi: `esi.client.Market.GetMarketsRegionIdOrders` и т.д.
@@ -443,6 +450,39 @@ def fetch_corporation_contract_items(corporation_id: int, contract_id: int, char
         return data if isinstance(data, list) else ([] if data is None else [data])
 
     return _call_with_retry(_fetch)
+
+
+def _token_for_corp_structures(character_id: int) -> Token:
+    """Токен со скоупом списка структур корпорации; при отсутствии — ValueError."""
+    token = (
+        Token.objects.filter(character_id=character_id)
+        .require_scopes(SCOPE_CORP_STRUCTURES)
+        .require_valid()
+        .order_by("pk")
+        .first()
+    )
+    if token is None:
+        raise ValueError(f"No valid AA token with scope {SCOPE_CORP_STRUCTURES} for character {character_id}")
+    return token
+
+
+def fetch_corporation_structures(corporation_id: int, character_id: int) -> tuple[list[dict], bool]:
+    """Структуры корпорации постранично (§9.1, решение №37 §20).
+
+    Скоуп: ``esi-corporations.read_corporation_structures.v1`` — токен персонажа
+    провайдера. Возвращает ``(структуры, partial)``: ``partial=True`` при нехватке
+    лимита ошибок ESI. Элементы — dict/модель ESI с полями structure_id, name,
+    solar_system_id, type_id и т.п.
+    """
+    token = _token_for_corp_structures(character_id)
+    structures: list[Any] = []
+    op = esi.client.Corporations.GetCorporationsCorporationIdStructures
+    try:
+        for page_rows, _resp in _page_results(op, corporation_id=corporation_id, token=token):
+            structures.extend(page_rows)
+        return structures, False
+    except RateLimitStop:
+        return structures, True
 
 
 def fetch_character_contracts(character_id: int) -> tuple[list[Any], bool]:

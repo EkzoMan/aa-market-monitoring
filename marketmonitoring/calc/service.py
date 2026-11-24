@@ -13,7 +13,13 @@ from django.apps import apps
 from django.db.models import Q
 from django.utils import timezone
 
-from ..constants import ContractFitStatus, FitStatus, LocationKind, ScopeKind, SyncStatus
+from ..constants import (
+    ContractFitStatus,
+    FitStatus,
+    LocationKind,
+    ScopeKind,
+    SyncStatus,
+)
 from ..models import (
     ComponentRequest,
     ContractCache,
@@ -86,13 +92,21 @@ def _npc_station_ids(scope_kind: str, scope_ref: int) -> set[int]:
     if scope_kind == ScopeKind.STATION:
         return {scope_ref}
     if scope_kind == ScopeKind.SYSTEM:
-        return set(EveSolarSystem.objects.filter(id=scope_ref).values_list("eve_stations__id", flat=True))
+        # values_list по обратной FK — LEFT JOIN: система без станций даёт строку NULL.
+        # None в локациях области ломает выборки (start_location_id__in=[None]) — исключаем.
+        return {
+            station_id
+            for station_id in EveSolarSystem.objects.filter(id=scope_ref).values_list("eve_stations__id", flat=True)
+            if station_id is not None
+        }
     if scope_kind == ScopeKind.REGION:
-        return set(
-            EveSolarSystem.objects.filter(eve_constellation__eve_region_id=scope_ref).values_list(
+        return {
+            station_id
+            for station_id in EveSolarSystem.objects.filter(eve_constellation__eve_region_id=scope_ref).values_list(
                 "eve_stations__id", flat=True
             )
-        )
+            if station_id is not None
+        }
     logger.warning("Unknown scope kind: %s", scope_kind)
     return set()
 
@@ -118,6 +132,57 @@ def _enabled_structure_ids(scope_kind: str, scope_ref: int) -> set[int]:
 def resolve_scope_ids(scope_kind: str, scope_ref: int) -> set[int]:
     """Множество локаций L(S) области (§6.1): NPC-станции ∪ включённые структуры."""
     return _npc_station_ids(scope_kind, scope_ref) | _enabled_structure_ids(scope_kind, scope_ref)
+
+
+def _enabled_contract_system_ids(scope_kind: str, scope_ref: int) -> set[int]:
+    """Включённые локации-системы внутри области (поиск контрактов, §6.12).
+
+    Локация-система (MarketLocation kind=system) расширяет область поиска
+    контрактов: если система входит в область фита (station — система этой
+    станции; system — сама система; region — система региона), контракты
+    учитываются по всем локациям выдачи этой системы.
+    """
+    qs = MarketLocation.objects.filter(enabled=True, kind=LocationKind.SYSTEM)
+    if scope_kind == ScopeKind.SYSTEM:
+        qs = qs.filter(solar_system_id=scope_ref)
+    elif scope_kind == ScopeKind.REGION:
+        qs = qs.filter(region_id=scope_ref)
+    elif scope_kind == ScopeKind.STATION:
+        EveStation = apps.get_model("eveuniverse", "EveStation")
+        system_id = EveStation.objects.filter(pk=scope_ref).values_list("eve_solar_system_id", flat=True).first()
+        if system_id is None:
+            return set()
+        qs = qs.filter(solar_system_id=system_id)
+    else:
+        logger.warning("Unknown scope kind: %s", scope_kind)
+        return set()
+    # solar_system_id nullable: NULL у некорректных записей не должен попадать в системы.
+    return {system_id for system_id in qs.values_list("solar_system_id", flat=True) if system_id is not None}
+
+
+def resolve_contract_location_ids(scope_kind: str, scope_ref: int) -> set[int]:
+    """Локации выдачи контрактов для области фита (§6.12).
+
+    L(S) области ∪ все локации выдачи включённых локаций-систем области:
+    NPC-станции системы (SDE) + структуры системы из MarketLocation.
+    Структуры без записи MarketLocation не резолвятся — их start_location_id
+    остаётся за пределами поиска (неизвестна система выдачи).
+    """
+    location_ids = resolve_scope_ids(scope_kind, scope_ref)
+    EveSolarSystem = apps.get_model("eveuniverse", "EveSolarSystem")
+    for system_id in _enabled_contract_system_ids(scope_kind, scope_ref):
+        # Тот же LEFT JOIN-NULL: система без станций не должна давать локацию None.
+        location_ids |= {
+            station_id
+            for station_id in EveSolarSystem.objects.filter(id=system_id).values_list("eve_stations__id", flat=True)
+            if station_id is not None
+        }
+        location_ids |= set(
+            MarketLocation.objects.filter(
+                enabled=True, kind=LocationKind.STRUCTURE, structure_id__isnull=False, solar_system_id=system_id
+            ).values_list("structure_id", flat=True)
+        )
+    return location_ids
 
 
 # ---------------------------------------------------------------------------
@@ -262,10 +327,15 @@ def evaluate_fit_contracts(
         no_data_res = engine.calc_contracts_fit([], required_components, fit.qty_target, has_no_data=True)
         return no_data_res, [], contract_reasons
 
+    # Локации выдачи контрактов: L(S) области ∪ локации выдачи включённых
+    # локаций-систем области (§6.12, поиск контрактов по системам).
     if scope_cache is not None:
-        location_ids = _resolve_scope_cached(scope_cache, fit.scope_kind, fit.scope_ref)
+        cache_key = ("contracts", fit.scope_kind, fit.scope_ref)
+        if cache_key not in scope_cache:
+            scope_cache[cache_key] = resolve_contract_location_ids(fit.scope_kind, fit.scope_ref)
+        location_ids = scope_cache[cache_key]
     else:
-        location_ids = resolve_scope_ids(fit.scope_kind, fit.scope_ref)
+        location_ids = resolve_contract_location_ids(fit.scope_kind, fit.scope_ref)
 
     if not location_ids:
         no_scope_res = engine.calc_contracts_fit([], required_components, fit.qty_target, has_no_data=True)

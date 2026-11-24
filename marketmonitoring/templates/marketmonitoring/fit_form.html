@@ -144,6 +144,65 @@
   </div>
 </div>
 
+{# Выбор области фита из списка: скрытый scope_ref + поиск по SDE
+   (station_search / system_search / region_search; UI к ESI не обращается, §5.10). #}
+<script>
+  (function () {
+    var kindSel = document.getElementById("id_scope_kind");
+    var input = document.getElementById("scope-ref-search");
+    var hidden = document.getElementById("id_scope_ref");
+    if (!kindSel || !input || !hidden) return;
+    var box = document.getElementById("scope-ref-results");
+    if (!box) {
+      box = document.createElement("select");
+      box.id = "scope-ref-results";
+      box.className = "form-control form-control-sm mt-1";
+      box.size = 5;
+      box.style.display = "none";
+      input.parentNode.appendChild(box);
+    }
+    var timer = null;
+    function endpoint(kind) {
+      if (kind === "station") return "{% url 'marketmonitoring:station_search' %}";
+      if (kind === "system") return "{% url 'marketmonitoring:system_search' %}";
+      return "{% url 'marketmonitoring:region_search' %}";
+    }
+    function render(results) {
+      box.innerHTML = "";
+      if (!results.length) { box.style.display = "none"; return; }
+      results.forEach(function (r) {
+        var opt = document.createElement("option");
+        opt.value = r.id;
+        opt.textContent = r.name + " (" + r.id + ")";
+        box.appendChild(opt);
+      });
+      box.style.display = "block";
+    }
+    input.addEventListener("input", function () {
+      hidden.value = "";
+      window.clearTimeout(timer);
+      var q = input.value.trim();
+      if (q.length < 2) { box.style.display = "none"; return; }
+      timer = window.setTimeout(function () {
+        fetch(endpoint(kindSel.value) + "?q=" + encodeURIComponent(q))
+          .then(function (r) { return r.json(); })
+          .then(function (data) { render(data.results || []); })
+          .catch(function () {});
+      }, 300);
+    });
+    box.addEventListener("change", function () {
+      hidden.value = box.value;
+      input.value = box.selectedOptions[0].textContent;
+      box.style.display = "none";
+    });
+    kindSel.addEventListener("change", function () {
+      hidden.value = "";
+      input.value = "";
+      box.style.display = "none";
+    });
+  })();
+</script>
+
 {# Добавление строки через SDE-селектор: JSON-поиск type_search (без ESI, §5.10).
    Строка клонируется из <template> с Django-рендером (row_proto) — значения
    префикса __proto__ заменяются на row<i>-; choices не дублируются в JS.

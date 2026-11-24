@@ -6,7 +6,6 @@ UI обращается только к БД плагина и справочн�
 
 import logging
 from collections import defaultdict
-from decimal import Decimal
 
 from django.contrib import messages
 from django.contrib.auth.decorators import login_required
@@ -20,9 +19,8 @@ from ..calc import engine
 from ..calc.engine import ComponentInput
 from ..calc.service import resolve_scope_ids
 from ..constants import ContractFitStatus, FitStatus, ScopeKind
-from ..models import ComponentRequest, Fit, FitComponent, StockLevel, SyncRun
+from ..models import Fit, FitComponent, StockLevel, SyncRun
 from ..tasks import SYNC_LOCK_KEY
-from ._calc_view import build_component_request_rows
 
 logger = logging.getLogger("marketmonitoring")
 
@@ -175,7 +173,8 @@ def index(request):
             {"fit": fit, "bottleneck_names": names, "bottleneck_extra": max(0, len(names) - BOTTLENECK_DISPLAY_LIMIT)}
         )
 
-    # Сводная панель: в первую очередь корабли в контрактах (§6.12), затем докупка рынка (§14).
+    # Сводная панель (§14): контракты в первую очередь; стоимость из блока
+    # убрана — главное число: фиты с дефицитом контрактов.
     contracts_deficit_fits_count = sum(1 for fit in fits if fit.contracts_status_cache == ContractFitStatus.DEFICIT)
     contracts_missing_ships_total = sum(
         max(0, fit.qty_target - (fit.contracts_available or 0))
@@ -183,20 +182,8 @@ def index(request):
         if fit.contracts_status_cache == ContractFitStatus.DEFICIT
     )
     contracts_no_data_count = sum(1 for fit in fits if fit.contracts_status_cache == ContractFitStatus.NO_DATA)
-    total_to_buy = sum(
-        (fit.total_cost for fit in fits if fit.status_cache == FitStatus.DEFICIT and fit.total_cost), Decimal("0")
-    )
     no_data_count = sum(1 for fit in fits if fit.status_cache == FitStatus.NO_DATA)
     hull_missing_count = sum(1 for fit in fits if fit.status_cache == FitStatus.HULL_MISSING)
-
-    # Перекрёстная сводка Dashboard ↔ Components (§14.4): счётчик и сумма компонентов
-    # с дефицитом; полный список живёт на странице Components, здесь — только агрегат.
-    component_rows = build_component_request_rows(list(ComponentRequest.objects.all()))
-    deficit_component_count = sum(1 for row in component_rows if row["deficit"] is not None and row["deficit"] > 0)
-    deficit_component_total = sum(
-        (row["cost"] for row in component_rows if row["deficit"] is not None and row["deficit"] > 0 and row["cost"]),
-        Decimal("0"),
-    )
 
     scope_pairs = list(Fit.objects.values_list("scope_kind", "scope_ref").distinct())
     scope_labels = _scope_labels(scope_pairs)
@@ -227,11 +214,8 @@ def index(request):
         "contracts_deficit_fits_count": contracts_deficit_fits_count,
         "contracts_missing_ships_total": contracts_missing_ships_total,
         "contracts_no_data_count": contracts_no_data_count,
-        "total_to_buy": total_to_buy,
         "no_data_count": no_data_count,
         "hull_missing_count": hull_missing_count,
-        "deficit_component_count": deficit_component_count,
-        "deficit_component_total": deficit_component_total,
         "has_any_fits": Fit.objects.exists(),
         "in_progress": cache.get(SYNC_LOCK_KEY) is not None,
         "last_checked_at": Fit.objects.aggregate(Max("last_checked_at"))["last_checked_at__max"],

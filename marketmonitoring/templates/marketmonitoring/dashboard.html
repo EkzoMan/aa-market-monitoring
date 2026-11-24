@@ -32,13 +32,13 @@
       <div class="card-body">
         <div class="mb-2 pb-2 border-bottom">
           <div class="d-flex align-items-baseline gap-2">
-            <span class="h4 mm-num mb-0">{{ contracts_missing_ships_total }}</span>
-            <span class="text-body-secondary small">{% translate "ships missing on contracts" %}</span>
+            <span class="h4 mm-num mb-0">{{ contracts_deficit_fits_count }}</span>
+            <span class="text-body-secondary small">{% translate "fits with contract deficit" %}</span>
           </div>
           <div class="small">
             {% if contracts_deficit_fits_count %}
             <a href="?contracts_status=deficit" class="text-warning">
-              {% blocktranslate count counter=contracts_deficit_fits_count %}{{ counter }} fit with contract deficit{% plural %}{{ counter }} fits with contract deficit{% endblocktranslate %}
+              {% blocktranslate count counter=contracts_missing_ships_total %}{{ counter }} ship missing on contracts{% plural %}{{ counter }} ships missing on contracts{% endblocktranslate %}
             </a>
             {% elif contracts_no_data_count %}
             <a href="?contracts_status=no_data" class="text-body-secondary">
@@ -49,12 +49,10 @@
             {% endif %}
           </div>
         </div>
-        <div class="h3 mm-num mb-1">{{ total_to_buy|isk }} <small class="text-body-secondary">ISK</small></div>
-        <div class="text-body-secondary small mb-2">{% translate "Total to buy" %}</div>
         {% if no_data_count %}
         <p class="text-body-secondary small mb-1">
-          {% translate "NO_DATA fits are not included in the sum." %}
-          <a href="?status=no_data">{% blocktranslate count counter=no_data_count %}{{ counter }} fit has no data{% plural %}{{ counter }} fits have no data{% endblocktranslate %}</a>
+          <a href="?status=no_data">{% blocktranslate count counter=no_data_count %}{{ counter }} fit has no data{% plural %}{{ counter }} fits have no data{% endblocktranslate %}
+        </a>
         </p>
         {% endif %}
         {% if hull_missing_count %}
@@ -63,10 +61,6 @@
           {% blocktranslate count counter=hull_missing_count %}{{ counter }} fit missing hull{% plural %}{{ counter }} fits missing hull{% endblocktranslate %}
         </p>
         {% endif %}
-        <p class="mb-1">
-          {% blocktranslate count counter=deficit_component_count %}{{ counter }} component with deficit{% plural %}{{ counter }} components with deficit{% endblocktranslate %}
-          <a href="{% url 'marketmonitoring:components' %}" class="ms-1" aria-label="{% translate 'Components' %}">&rarr;</a>
-        </p>
         <p class="text-body-secondary small mb-0">{% translate "Last checked" %}: {{ last_checked_at|date:"Y-m-d H:i" }}</p>
         {% if last_run %}
         <p class="text-body-secondary small mb-0">{% translate "Last sync" %}: {{ last_run.task_name }} ({{ last_run.status }})</p>

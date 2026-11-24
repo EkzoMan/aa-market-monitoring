@@ -69,9 +69,11 @@ def sde_ids(db):
     group, _ = EveGroup.objects.get_or_create(
         id=1, defaults={"name": "ShipGroup", "eve_category": category, "published": True}
     )
+    # Имя не должно совпадать с «Ferox» из фикстуры eve_types (test_eft_parser):
+    # иначе resolve_type_name находит дубликат и корпус фита резолвится в id=1.
     eve_type = EveType.objects.create(
         id=1,
-        name="Ferox",
+        name="Ferox Test Hull",
         eve_group=group,
         published=True,
         packaged_volume=15000,

@@ -13,7 +13,14 @@ from django.utils import timezone
 
 from ..calc import engine
 from ..calc.engine import ContractInput, ContractItemInput
-from ..constants import ContractFitStatus, ContractSourceKind, FitStatus, NotificationEvent, ScopeKind, SyncStatus
+from ..constants import (
+    ContractFitStatus,
+    ContractSourceKind,
+    FitStatus,
+    NotificationEvent,
+    ScopeKind,
+    SyncStatus,
+)
 from ..esi import client as esi_client
 from ..models import (
     ContractCache,
@@ -313,6 +320,56 @@ def test_evaluate_fit_contracts_counts_matching_outstanding_kits(settings_row, f
     assert [c.contract_id for c, _ships in matched] == [7001]
 
 
+@pytest.mark.django_db
+def test_resolve_contract_locations_system_without_stations_is_empty(sde_ids, settings_row):
+    """Система без NPC-станций: L(S) пустое, а не {None} (регрессия LEFT JOIN NULL).
+
+    values_list по обратной FK даёт строку NULL для системы без станций;
+    None в локациях делал выборку start_location_id__in=[None] пустой,
+    а проверку «область не пустая» — пройденной → ложный deficit.
+    """
+    from eveuniverse.models import EveSolarSystem
+
+    from ..calc.service import resolve_contract_location_ids
+
+    empty_system = EveSolarSystem.objects.create(
+        id=30001555, name="Lonely", eve_constellation=sde_ids["system"].eve_constellation, security_status=0.5
+    )
+    location_ids = resolve_contract_location_ids(ScopeKind.SYSTEM, empty_system.id)
+    assert location_ids == set()
+    assert None not in location_ids
+
+
+@pytest.mark.django_db
+def test_evaluate_fit_contracts_system_without_stations_is_no_data(sde_ids, settings_row, contract_character):
+    """Фит в системе без NPC-станций и структур → NO_DATA с причиной, не deficit (§6.12)."""
+    from eveuniverse.models import EveSolarSystem
+
+    from ..calc.service import evaluate_fit_contracts
+
+    provider = ContractProvider.objects.create(
+        character=contract_character, source_kind=ContractSourceKind.CORPORATION, sync_status=SyncStatus.OK
+    )
+    provider.last_synced_at = timezone.now()
+    provider.save(update_fields=["last_synced_at"])
+    empty_system = EveSolarSystem.objects.create(
+        id=30001555, name="Lonely", eve_constellation=sde_ids["system"].eve_constellation, security_status=0.5
+    )
+    fit = Fit.objects.create(
+        name="Empty system fit",
+        hull_type_id=sde_ids["hull_type"].id,
+        qty_target=1,
+        scope_kind=ScopeKind.SYSTEM,
+        scope_ref=empty_system.id,
+    )
+    FitComponent.objects.create(fit=fit, type_id=sde_ids["hull_type"].id, qty_per_fit=1)
+
+    result, matched, reasons = evaluate_fit_contracts(fit)
+    assert result.status == ContractFitStatus.NO_DATA
+    assert matched == []
+    assert any("no locations resolved" in reason for reason in reasons)
+
+
 # --- ESI-клиент контрактов (§9.1) -----------------------------------------
 
 
@@ -465,6 +522,58 @@ def test_sync_contracts_removes_disappeared_and_expired_contracts(contract_provi
 
     assert not ContractCache.objects.filter(contract_id=7200).exists()
     assert not ContractItemCache.objects.filter(contract_id=old.pk).exists()
+
+
+@pytest.mark.django_db
+def test_sync_contracts_keeps_cross_endpoint_contract(contract_provider):
+    """Кросс-эндпоинтовый контракт не удаляется синком одного источника (решение №38 §20).
+
+    Контракт виден и в корпоративном, и в персонажном срезах. Корпоративный провайдер
+    возвращает пустой срез, персонажный — контракт. Кэш (записанный от корпоративного
+    источника) должен выжить: финальная зачистка идёт по объединённому active-множеству.
+    """
+    from ..tasks import sync_contracts
+
+    # Провайдер персонажных контрактов с меньшим приоритетом (обходится вторым).
+    ContractProvider.objects.create(
+        character=contract_provider.character,
+        source_kind=ContractSourceKind.CHARACTER,
+        enabled=True,
+        priority=20,
+        sync_status=SyncStatus.OK,
+    )
+    # Кэш контракта от корпоративного источника.
+    ContractCache.objects.create(
+        contract_id=7300,
+        source_kind=ContractSourceKind.CORPORATION,
+        source_ref=9002,
+        issuer_id=1,
+        issuer_corporation_id=9002,
+        assignee_id=9002,
+        availability="corporation",
+        contract_type="item_exchange",
+        status="outstanding",
+        start_location_id=60003760,
+        price=Decimal("1"),
+        date_issued=timezone.now(),
+        date_expired=timezone.now() + timedelta(days=1),
+        fetched_at=timezone.now(),
+    )
+
+    contract = _contract_raw(contract_id=7300)
+    items = [_item_raw(587, 1)]
+
+    with (
+        mock.patch.object(esi_client, "fetch_corporation_contracts", return_value=([], False)),
+        mock.patch.object(esi_client, "fetch_character_contracts", return_value=([contract], False)),
+        mock.patch.object(esi_client, "fetch_character_contract_items", return_value=items),
+        mock.patch("marketmonitoring.tasks._chain_recalc_and_notify"),
+    ):
+        result = sync_contracts(trigger="manual", lock_token="tok-x")
+
+    assert result["ok"] is True
+    # Контракт пережил зачистку корпоративного источника — активен в персонажном срезе.
+    assert ContractCache.objects.filter(contract_id=7300).exists()
 
 
 @pytest.mark.django_db

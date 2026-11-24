@@ -11,7 +11,7 @@ from django.test import Client
 from django.urls import reverse
 
 from ..auth_hooks import GROUP_EDIT, GROUP_VIEW
-from ..models import ComponentRequest, Fit
+from ..models import Fit
 from .test_calc_engine import sde_ids  # noqa: F401 — справочники eveuniverse (система/станции)
 from .test_eft_parser import eve_types  # noqa: F401 — записи EveType
 
@@ -117,19 +117,6 @@ def _add_stock(location_id, type_id, volume):
     return stock
 
 
-def test_dashboard_deficit_component_counter(viewer_client, fit_with_component, eve_types):  # noqa: F811
-    """Перекрёстная сводка (§14.4): счётчик компонентов с дефицитом со ссылкой на Components."""
-    from ..models import ComponentRequest
-
-    ComponentRequest.objects.create(type_id=2046, qty_target=99, scope_kind="system", scope_ref=30000142)
-    # Область «system 30000142» = станции 60003760 и 60003761 — наличие на обеих (иначе NO_DATA).
-    _add_stock(60003760, 2046, 1)
-    _add_stock(60003761, 2046, 1)
-    content = viewer_client.get(reverse("marketmonitoring:index")).content.decode()
-    assert "component with deficit" in content
-    assert reverse("marketmonitoring:components") in content
-
-
 # ---------------------------------------------------------------------------
 # Карточка фита
 # ---------------------------------------------------------------------------
@@ -215,32 +202,6 @@ def test_fit_detail_edit_buttons_hidden_for_view(viewer_client, fit_with_compone
 
 
 # ---------------------------------------------------------------------------
-# Components
-# ---------------------------------------------------------------------------
-
-
-def test_components_empty_state_and_cta(viewer_client, editor_client, db):
-    """Пустая страница Components: empty state, CTA только для _edit (04-components.md)."""
-    viewer_content = viewer_client.get(reverse("marketmonitoring:components")).content.decode()
-    assert "No standalone components yet." in viewer_content
-    assert reverse("marketmonitoring:component_create") not in viewer_content
-
-    editor_content = editor_client.get(reverse("marketmonitoring:components")).content.decode()
-    assert reverse("marketmonitoring:component_create") in editor_content
-
-
-def test_components_summary_strip(viewer_client, fit_with_component, eve_types):  # noqa: F811
-    """Summary strip (04-components.md): сводка «N компонентов с дефицитом · сумма»."""
-    from ..models import ComponentRequest
-
-    ComponentRequest.objects.create(type_id=2046, qty_target=99, scope_kind="system", scope_ref=30000142)
-    _add_stock(60003760, 2046, 1)
-    _add_stock(60003761, 2046, 1)
-    content = viewer_client.get(reverse("marketmonitoring:components")).content.decode()
-    assert "component with deficit" in content
-
-
-# ---------------------------------------------------------------------------
 # Confirm-экраны
 # ---------------------------------------------------------------------------
 
@@ -250,14 +211,6 @@ def test_fit_delete_confirm_screen(editor_client, fit_with_component):
     content = editor_client.get(reverse("marketmonitoring:fit_delete", args=[fit_with_component.pk])).content.decode()
     assert "cannot be undone" in content
     assert "border-danger" in content
-
-
-def test_component_delete_confirm_screen(editor_client, fit_with_component):
-    """Confirm-экран удаления компонента: объяснение последствий (04-components.md)."""
-    request = ComponentRequest.objects.create(type_id=2046, qty_target=5, scope_kind="system", scope_ref=30000142)
-    content = editor_client.get(reverse("marketmonitoring:component_delete", args=[request.pk])).content.decode()
-    assert "cannot be undone" in content
-    assert "fits are not affected" in content
 
 
 def test_location_delete_confirm_screen(editor_client, db):

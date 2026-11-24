@@ -55,9 +55,6 @@ def _register_menu_hooks() -> None:
     class MarketMonitoringMenuItem(_BaseMenuItem):
         pass
 
-    class ComponentsMenuItem(_BaseMenuItem):
-        pass
-
     class LocationsMenuItem(_BaseMenuItem):
         pass
 
@@ -71,13 +68,6 @@ def _register_menu_hooks() -> None:
         return MarketMonitoringMenuItem(
             _("Market Monitoring"), "marketmonitoring:index", "fas fa-chart-line", 1200, has_view
         )
-
-    @hooks.register("menu_item_hook")
-    def register_components_menu():
-        """Пункт меню «Components» — отдельный раздел рядом с Dashboard (§14.4)."""
-        from .auth_hooks import has_view
-
-        return ComponentsMenuItem(_("Components"), "marketmonitoring:components", "fas fa-cubes", 1210, has_view)
 
     @hooks.register("menu_item_hook")
     def register_locations_menu():

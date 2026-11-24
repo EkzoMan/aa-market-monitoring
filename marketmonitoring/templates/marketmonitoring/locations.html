@@ -84,6 +84,16 @@
           {{ form.region_id }}
           {{ form.solar_system_id.errors }}
         </div>
+        <div class="col-12 mm-system-note" style="display:none">
+          <small class="form-text text-body-secondary">
+            {% translate "A system location extends the contract search: when the system is inside a fit's scope, contracts issued at any location of this system (NPC stations and known structures) are counted." %}
+          </small>
+        </div>
+        <div class="col-12 mm-system-note" style="display:none">
+          <small class="form-text text-body-secondary">
+            {% translate "A system location extends the contract search: when the system is inside a fit's scope, contracts issued at any location of this system (NPC stations and known structures) are counted." %}
+          </small>
+        </div>
         <div class="col-12 col-md-6 mm-station-only">
           {{ form.station_id.label_tag }}
           <input type="text" id="station-search" class="form-control form-control-sm" autocomplete="off" placeholder="{% translate 'Start typing a station name' %}">
@@ -111,8 +121,16 @@
   var kind = document.getElementById("id_kind");
   function update() {
     var isStructure = kind.value === "{{ kind_structure }}";
-    document.querySelectorAll(".mm-station-only").forEach(function (el) { el.style.display = isStructure ? "none" : "block"; });
-    document.querySelectorAll(".mm-structure-only").forEach(function (el) { el.style.display = isStructure ? "block" : "none"; });
+    var isSystem = kind.value === "{{ kind_system }}";
+    document.querySelectorAll(".mm-station-only").forEach(function (el) {
+      el.style.display = isStructure || isSystem ? "none" : "block";
+    });
+    document.querySelectorAll(".mm-structure-only").forEach(function (el) {
+      el.style.display = isStructure ? "block" : "none";
+    });
+    document.querySelectorAll(".mm-system-note").forEach(function (el) {
+      el.style.display = isSystem ? "block" : "none";
+    });
   }
   kind.addEventListener("change", update);
   update();
@@ -255,6 +273,12 @@
   structureInput.addEventListener("input", function () {
     window.clearTimeout(structureTimer);
     window.clearInterval(structurePoll);
+    // Пользователь ищет структуру → Kind обязан быть structure (по умолчанию
+    // стоит station, и форма уходит в ветку NPC-станции с ошибкой SDE).
+    if (kind.value !== "{{ kind_structure }}") {
+      kind.value = "{{ kind_structure }}";
+      kind.dispatchEvent(new Event("change"));
+    }
     var q = structureInput.value.trim();
     if (q.length < 3) { structureBox.style.display = "none"; return; }
     structureTimer = window.setTimeout(function () {
