@@ -6,6 +6,7 @@ Discord полностью замокан на уровне HTTP (requests.post)
 только при переходе состояния.
 """
 
+import json
 from datetime import timedelta
 from decimal import Decimal
 from types import SimpleNamespace
@@ -158,6 +159,21 @@ def test_notify_deficit_sends_and_dedupes_same_state(eve_types, webhook_row, db)
         assert post.call_count == first_post_count
 
 
+def test_notify_deficit_without_jita_has_no_zero_isk(eve_types, webhook_row, db):  # noqa: F811
+    """Выключенная Jita: уведомление о дефиците отправляется, но без «0 ISK» (§13)."""
+    fit = _seed_deficit(db)
+    MarketLocation.objects.filter(station_id=STATION_ID).update(enabled=False)
+    with mock.patch("marketmonitoring.notify.discord.requests.post", side_effect=_http_ok) as post:
+        result = tasks.notify_deficit(trigger=TriggerKind.BEAT)
+
+    assert result["sent"] == 1
+    assert NotificationLog.objects.filter(event="deficit", ok=True).exists()
+    payload_text = "\n".join(json.dumps(call.kwargs, ensure_ascii=False) for call in post.call_args_list)
+    assert "0 ISK" not in payload_text
+    fit.refresh_from_db()
+    assert fit.total_cost is None
+
+
 def test_notify_deficit_sends_on_state_change(eve_types, webhook_row, db):  # noqa: F811
     """Изменение состояния (сумма докупки) → повторная отправка (§13.1)."""
     _seed_deficit(db)
@@ -293,11 +309,16 @@ STRUCTURE_ID = 1048576000001
 
 @pytest.fixture
 def corp_contract_provider(db):
-    """Персонаж AA + включённый corporation ContractProvider для синка структур."""
+    """Персонаж AA + включённый corporation ContractProvider для синка структур.
+
+    Локальный PK намеренно равен 9001, а CCP character_id — 99001: регрессия
+    подмены CCP ID локальным PK (боевой лог провайдеров структур).
+    """
     eve_char = EveCharacter.objects.create(
-        character_id=9001,
+        pk=9001,
+        character_id=99001,
         character_name="Structure Pilot",
-        corporation_id=9002,
+        corporation_id=99002,
         corporation_name="Corp",
         corporation_ticker="CRP",
     )
@@ -318,7 +339,9 @@ def test_sync_corp_structures_registers_new_structures_disabled(corp_contract_pr
     with mock.patch.object(tasks.esi_client, "fetch_corporation_structures", return_value=(structures, False)) as fetch:
         result = tasks.sync_corp_structures(trigger="manual")
 
-    fetch.assert_called_once_with(9002, 9001)
+    fetch.assert_called_once_with(99002, 99001)
+    # Локальный PK EveCharacter отличается от CCP ID — в ESI уходит именно CCP ID.
+    assert corp_contract_provider.character.pk == 9001
     assert result["ok"] is True
     assert result["structures"] == 1
     location = MarketLocation.objects.get(structure_id=STRUCTURE_ID)
@@ -387,3 +410,6 @@ def test_sync_corp_structures_acl_failure_marks_provider(corp_contract_provider,
     assert corp_contract_provider.sync_status == SyncStatus.NO_ACL
     run = SyncRun.objects.filter(task_name="marketmonitoring.sync_corp_structures").order_by("-pk").first()
     assert "ACL 403" in run.errors
+    # В логах/ошибках — CCP character_id, а не локальный PK EveCharacter.
+    assert "corp structures provider 99001: ACL 403" in run.errors
+    assert "corp structures provider 9001: ACL 403" not in run.errors

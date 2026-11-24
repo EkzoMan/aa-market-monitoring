@@ -13,7 +13,7 @@
 - Расчёт собираемости K, дефицита D по каждому компоненту, цены покрытия по стакану Jita, стоимости докупки, флагов `OVERPRICE` / `NOT_COVERED`, статусов `OK` / `DEFICIT` / `HULL_MISSING` / `NO_DATA`.
 - Проверка полных комплектов кораблей фита в открытых `item_exchange` контрактах (корпоративных, альянсовых и персональных): C из N.
 - Сводка доступных кораблей C + K: отдельные счётчики C (контракты) и K (рынок в области фита), агрегатный дефицит `max(0, N-(C+K))` и общий статус `ships_status_cache`.
-- Фоновые задачи Celery (синк Jita, регионов, структур, контрактов, пересчёт, очистка кэша, проверка провайдеров) + ручной запуск обновления из UI.
+- Фоновые задачи Celery (синк Jita — только при включённой локации Jita IV-4, регионов, структур, контрактов, пересчёт, очистка кэша, проверка провайдеров) + ручной запуск обновления из UI.
 - Пул провайдеров структур и контрактов (персонажи AA): приоритет, cooldown при ACL-сбое, автоматическое отключение после серии сбоев.
 - Discord webhook (один канал): дефицит (`deficit`, `contracts_deficit`, `ships_deficit`, только при beat), `HULL_MISSING`, сбои провайдеров, сбой и восстановление синков.
 - Экспорт списка закупки: буфер обмена (multibuy), `.txt`, `.csv`.
@@ -60,16 +60,18 @@ python manage.py migrate
 
 Группы прав `market_monitoring_view` и `market_monitoring_edit` создаются автоматически миграцией данных (см. [docs/configuration.md](docs/configuration.md)).
 
-Настройка наценки/порогов, привязка провайдеров структур и контрактов, а также диагностика `NO_DATA` описаны в [docs/configuration.md](docs/configuration.md).
+Настройка наценки/порогов, привязка провайдеров структур и контрактов, а также диагностика `NO_DATA` описаны в [docs/configuration.md](docs/configuration.md). Различайте два случая: **нет локальных данных → `NO_DATA`** (дефицит и стоимость не считаются); **нет Jita → цена докупки недоступна, но не `NO_DATA`**. Если `unit`/`ref`/`cost`/`shortfall`/`overprice_pct` показывают `&mdash;`, `Fit.total_cost=None`, экспорт закупки пуст, проверьте, что локация Jita IV-4 добавлена и включена на странице Locations: без неё стакан не синхронизируется, кэш очищается и устаревшая цена не показывается. Карточка и Dashboard показывают `&mdash;` вместо `0 ISK`, уведомления о дефиците не содержат стоимость; статус фита, `K`, `D_i` и контракты при этом считаются по локальным рынкам.
 
 ## Beat-расписание (§12.2)
 
 Эталонное расписание Celery beat — фабрика `marketmonitoring.tasks.build_beat_schedule()`:
 
-- каждые 5 минут: `sync_jita_book`, `sync_region_orders`, `sync_structure_orders`, `sync_contracts`, `verify_providers`, `notify_deficit`;
+- каждые 5 минут: `sync_jita_book` (только при включённой локации Jita IV-4), `sync_region_orders`, `sync_structure_orders`, `sync_contracts`, `verify_providers`, `notify_deficit`;
 - ежедневно: `cleanup_orphan_cache`, `sync_corp_structures`.
 
 Фактические интервалы выполнения проверяются guard'ами задач (§10, §12.2): guard-интервалы задач и настройки `jita_sync_interval_min` / `stock_sync_interval_min` / `contracts_sync_interval_min` не позволят задаче выполниться чаще разрешённого, даже при более частом beat-тике.
+
+«Обновить сейчас» (`_edit`) ставит `sync_region_orders`, `sync_structure_orders`, `sync_contracts` и затем `recalc_stock_levels`; `sync_jita_book` добавляется только при включённой локации Jita IV-4 — при выключенной Jita ручная цепочка состоит из 3 задач вместо 4. Если локация Jita IV-4 удалена/отключена, ESI-запросы к рынку Jita не выполняются ни в beat, ни вручную: The Forge жёстко исключается из регионов синка даже при явном `scope_kind='region'/'system'`, `JitaOrderLevel` и `MarketOrderCache(region, jita_region_id)` удаляются. Недоступна цена докупки (`&mdash;` / `None`, `Fit.total_cost=None`, OVERPRICE и экспорт пусты, уведомления о дефиците без стоимости); статус фита, `K`, `D_i` и контракты считаются по локальным рынкам, полный `NO_DATA` — только по §6.7. Расхождение буквального §9.4 ТЗ и решений №3/8/25/39 с указанием заказчика зафиксировано эрратой в [docs/architecture.md](docs/architecture.md), [docs/configuration.md](docs/configuration.md) и [docs/installation.md](docs/installation.md); решения не пересматриваются, ТЗ не редактируется.
 
 ## Документация
 

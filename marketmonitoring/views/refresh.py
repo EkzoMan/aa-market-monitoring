@@ -18,10 +18,14 @@ from django.views.decorators.http import require_POST
 
 from ..auth_hooks import has_edit, has_view
 from ..constants import SyncRunStatus, TriggerKind
+from ..esi.selectors import is_jita_enabled
 from ..models import Fit, SyncRun
 from ..tasks import (
     SYNC_LOCK_KEY,
     sync_contracts,
+    sync_jita_book,
+    sync_region_orders,
+    sync_structure_orders,
 )
 
 logger = logging.getLogger("marketmonitoring")
@@ -35,6 +39,10 @@ SYNC_LOCK_TIMEOUT = 3600
 def refresh(request):
     """«Обновить сейчас» (edit, §14): блокировка mm:sync_lock + цепочка sync_* с trigger=manual.
 
+    Запускаются заказы регионов (обновляют статус NPC-станций и локаций-систем),
+    заказы структур и открытые контракты; стакан Jita — только если локация
+    Jita включена в Locations (иначе задача не ставится, ESI не вызывается).
+    Итого 4 задачи при включённой Jita и 3 при выключенной.
     При занятой блокировке — 409 «обновление уже выполняется» (§12.4).
     Значение блокировки — уникальный токен запуска: он передаётся задачам цепочки,
     и финальная задача (recalc_stock_levels) снимает блокировку только при
@@ -51,7 +59,10 @@ def refresh(request):
         logger.info("Manual refresh rejected: sync lock is held")
         return HttpResponse(_("Update is already running."), status=409)
 
-    # Рыночные синки временно отключены: запускается только sync_contracts.
+    if is_jita_enabled():
+        sync_jita_book.delay(trigger=TriggerKind.MANUAL, lock_token=lock_token)
+    sync_region_orders.delay(trigger=TriggerKind.MANUAL, lock_token=lock_token)
+    sync_structure_orders.delay(trigger=TriggerKind.MANUAL, lock_token=lock_token)
     sync_contracts.delay(trigger=TriggerKind.MANUAL, lock_token=lock_token)
     messages.success(request, _("Update started."))
     return redirect("marketmonitoring:index")

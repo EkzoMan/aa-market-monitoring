@@ -22,18 +22,23 @@ NOTIFY_FUNC = "send_provider_acl_lost"
 
 def _available_providers(exclude_character_ids: set[int] | None = None):
     """QuerySet провайдеров, доступных для выбора (§11): enabled, не disabled,
-    не в активном cooldown; сортировка по priority, затем character_id."""
+    не в активном cooldown; сортировка по priority, затем CCP character_id.
+
+    ``exclude_character_ids`` — CCP ID из EveCharacter (не локальный PK FK),
+    поэтому исключение идёт по ``character__character_id``.
+    """
     now = timezone.now()
     # Буквальное прочтение §11: cooling_down доступен, если cooldown_until <= now.
     qs = (
-        StructureProvider.objects.filter(enabled=True)
+        StructureProvider.objects.select_related("character")
+        .filter(enabled=True)
         .exclude(status=ProviderStatus.DISABLED)
         .filter(_cooldown_ok_q(now))
     )
     if exclude_character_ids:
-        qs = qs.exclude(character_id__in=exclude_character_ids)
+        qs = qs.exclude(character__character_id__in=exclude_character_ids)
     # §11 сортировка: по CCP character_id (character__character_id), а не по pk FK.
-    return qs.order_by("priority", "character__character_id")
+    return qs.order_by("priority", "character__character_id", "pk")
 
 
 def _cooldown_ok_q(now):
@@ -46,7 +51,8 @@ def _cooldown_ok_q(now):
 def select_provider(structure_id: int, exclude_character_ids: set[int] | None = None) -> StructureProvider | None:
     """Выбор провайдера для структуры (§11): среди enabled=true, status != disabled,
     (status != cooling_down ИЛИ cooldown_until <= now) — по возрастанию priority,
-    затем character_id. Возвращает StructureProvider или None (локация no_provider).
+    затем CCP character_id. Возвращает StructureProvider или None (локация no_provider).
+    Исключаемые ID — тоже CCP ID из EveCharacter, не локальные PK FK.
 
     structure_id в выборке не участвует (пул общий для всех структур), параметр
     сохранён для сигнатуры задач и будущего расширения.
@@ -64,11 +70,12 @@ def cooldown_expired(provider: StructureProvider) -> bool:
     return provider.cooldown_until is None or provider.cooldown_until <= timezone.now()
 
 
-def _notify_acl_lost(provider: StructureProvider, *, disabled: bool) -> None:
+def _notify_acl_lost(provider: StructureProvider | ContractProvider, *, disabled: bool) -> None:
     """Точка вызова алерта provider_acl_lost (§11.3).
 
     notify-модуль появляется на этапе 7; пока функция вызывается через
     guarded import (importlib + hasattr) и молча пропускается, если её нет.
+    В уведомление уходит CCP character_id, а не локальный PK FK.
     """
     try:
         module = importlib.import_module(NOTIFY_MODULE)
@@ -80,7 +87,7 @@ def _notify_acl_lost(provider: StructureProvider, *, disabled: bool) -> None:
     try:
         func(
             provider=provider,
-            character_id=provider.character_id,
+            character_id=provider.character.character_id,
             acl_fail_count=provider.acl_fail_count,
             status=provider.status,
             disabled=disabled,
@@ -99,19 +106,20 @@ def handle_acl_failure(provider: StructureProvider) -> StructureProvider:
     provider_acl_lost с пометкой «отключён». Возвращает обновлённый объект.
     """
     settings_obj = PluginSetting.load()
+    character_id = provider.character.character_id  # CCP ID для логов и уведомлений
     provider.acl_fail_count += 1
     if provider.acl_fail_count >= settings_obj.provider_acl_max_failures:
         provider.status = ProviderStatus.DISABLED
         provider.cooldown_until = None
         disabled = True
-        logger.warning("Provider %s disabled after %s ACL failures", provider.character_id, provider.acl_fail_count)
+        logger.warning("Provider %s disabled after %s ACL failures", character_id, provider.acl_fail_count)
     else:
         provider.status = ProviderStatus.COOLING_DOWN
         provider.cooldown_until = timezone.now() + timedelta(minutes=settings_obj.provider_acl_cooldown_min)
         disabled = False
         logger.info(
             "Provider %s cooling down until %s (ACL failure %s/%s)",
-            provider.character_id,
+            character_id,
             provider.cooldown_until,
             provider.acl_fail_count,
             settings_obj.provider_acl_max_failures,
@@ -133,7 +141,8 @@ def handle_provider_success(provider: StructureProvider) -> StructureProvider:
 
 def switch_to_next_provider(structure_id: int, failed_character_ids: set[int]) -> StructureProvider | None:
     """Структура после 403 переобрабатывается следующим доступным провайдером
-    в том же прогоне (§11.2): выбор с исключением уже отказавших персонажей."""
+    в том же прогоне (§11.2): выбор с исключением уже отказавших персонажей.
+    ``failed_character_ids`` содержит только CCP ID (EveCharacter.character_id)."""
     return select_provider(structure_id, exclude_character_ids=set(failed_character_ids))
 
 
@@ -152,6 +161,7 @@ def available_contract_providers():
 def handle_contract_provider_acl_failure(provider: ContractProvider) -> ContractProvider:
     """Обработка 401/403 от ESI для провайдера контрактов (§11): cooldown и отключение при пороге."""
     settings_obj = PluginSetting.load()
+    character_id = provider.character.character_id  # CCP ID для логов и уведомлений
     provider.acl_fail_count += 1
     if provider.acl_fail_count >= settings_obj.provider_acl_max_failures:
         provider.status = ProviderStatus.DISABLED
@@ -159,7 +169,7 @@ def handle_contract_provider_acl_failure(provider: ContractProvider) -> Contract
         disabled = True
         logger.warning(
             "Contract provider %s (%s) disabled after %s ACL failures",
-            provider.character_id,
+            character_id,
             provider.source_kind,
             provider.acl_fail_count,
         )
@@ -169,7 +179,7 @@ def handle_contract_provider_acl_failure(provider: ContractProvider) -> Contract
         disabled = False
         logger.info(
             "Contract provider %s (%s) cooling down until %s (ACL failure %s/%s)",
-            provider.character_id,
+            character_id,
             provider.source_kind,
             provider.cooldown_until,
             provider.acl_fail_count,

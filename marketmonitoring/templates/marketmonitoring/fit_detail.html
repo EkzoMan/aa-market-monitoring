@@ -122,7 +122,7 @@
         {% else %}
         <span class="mm-num fw-semibold">&mdash; <span class="text-body-secondary">{% translate "of" %} {{ fit.qty_target }}</span></span>
         {% endif %}
-        <span class="ms-3 fw-semibold mm-num">{{ total_cost|isk }} <span class="text-body-secondary">ISK</span></span>
+        <span class="ms-3 fw-semibold mm-num">{% if total_cost is not None %}{{ total_cost|isk }} <span class="text-body-secondary">ISK</span>{% else %}&mdash;{% endif %}</span>
         <span class="text-body-secondary small">
           {% blocktranslate count counter=overprice_count %}{{ counter }} overprice position{% plural %}{{ counter }} overprice positions{% endblocktranslate %}
         </span>
@@ -199,7 +199,7 @@
           <td class="mm-num">{% if row.no_data %}&mdash;{% else %}{{ row.deficit }}{% endif %}</td>
           <td class="mm-num">{% if row.unit is not None %}{{ row.unit|isk }}{% else %}&mdash;{% endif %}</td>
           <td class="mm-num">{% if row.ref is not None %}{{ row.ref|isk }}{% else %}&mdash;{% endif %}</td>
-          <td class="mm-num">{% if row.no_data %}&mdash;{% else %}{{ row.cost|isk }}{% endif %}</td>
+          <td class="mm-num">{% if row.no_data or row.cost is None %}&mdash;{% else %}{{ row.cost|isk }}{% endif %}</td>
           <td>
             {% if row.is_not_covered %}
             {# Tooltip NOT_COVERED (§6.8): unit, ref, shortfall. #}
@@ -216,7 +216,7 @@
       <tfoot>
         <tr class="fw-bold" style="border-top: 2px solid var(--bs-border-color)">
           <td colspan="7">{% translate "Total" %}</td>
-          <td class="mm-num">{% if status != 'no_data' %}{{ total_cost|isk }}{% else %}&mdash;{% endif %}</td>
+          <td class="mm-num">{% if status != 'no_data' and total_cost is not None %}{{ total_cost|isk }}{% else %}&mdash;{% endif %}</td>
           <td></td>
         </tr>
       </tfoot>

@@ -57,7 +57,7 @@ python manage.py makemigrations --check
 
 1. https://developers.eveonline.com → Create New Application.
 2. Type: Authentication + API Access.
-3. Scopes: плагин сам запрашивает нужные скоупы через токены персонажей (`esi-markets.structure_markets.v1`, `esi-universe.read_structures.v1` — проверяются при привязке провайдера); типовые скоупы AA приложения оставьте стандартными.
+3. Scopes: CharLink запрашивает нужные скоупы через токены персонажей. Для `StructureProvider`: `esi-markets.structure_markets.v1`, `esi-universe.read_structures.v1` (проверяются при привязке) и `esi-search.search_structures.v1` (поиск структур с правами дока). Для `ContractProvider`: `esi-contracts.read_corporation_contracts.v1`, `esi-contracts.read_character_contracts.v1` и `esi-corporations.read_structures.v1` (список структур корпорации для `sync_corp_structures`). Типовые скоупы AA приложения оставьте стандартными.
 4. Callback URL — стандартный для вашей AA (`https://<ваш-auth>/sso/callback`).
 5. Пропишите в `settings.py`:
 
@@ -67,9 +67,13 @@ ESI_SSO_CLIENT_SECRET = "..."
 ESI_SSO_CALLBACK_URL = "https://<ваш-auth>/sso/callback"
 ```
 
+**Примечание (эррата к решению №37 §20 ТЗ).** Решение №37 сохраняется полностью: тот же эндпоинт, beat раз в сутки, `MarketLocation(kind=structure)` с `enabled=false`, ручное включение в Locations UI, ACL §11. Идентификатор `esi-corporations.read_corporation_structures.v1` из текста ТЗ — опечатка: такого scope не существует, SSO/CharLink отклоняет его как `invalid_scope`. Используйте `esi-corporations.read_structures.v1` — он указан в официальной OpenAPI-спеке ESI и запрошен в CharLink.
+
 ### 5. Celery / beat
 
-Beat дёргает `sync_jita_book`, `sync_region_orders`, `sync_structure_orders`, `sync_contracts`, `verify_providers` и `notify_deficit` **каждые 5 минут**; `cleanup_orphan_cache` и `sync_corp_structures` — ежедневно. Каждая задача сама проверяет, истёк ли её интервал (`jita_sync_interval_min`, `stock_sync_interval_min`, `contracts_sync_interval_min` — из настроек плагина; 60 мин для `verify_providers`, 24 ч для ежедневных задач), поэтому интервалы меняются в UI без правки beat-расписания. Частый beat — намеренное решение ТЗ (§12.2): расписание остаётся фиксированным, а логика частоты живёт в настройках. Готовое расписание даёт фабрика `marketmonitoring.tasks.build_beat_schedule()` (см. [README.md](../README.md)).
+Beat дёргает `sync_jita_book`, `sync_region_orders`, `sync_structure_orders`, `sync_contracts`, `verify_providers` и `notify_deficit` **каждые 5 минут**; `cleanup_orphan_cache` и `sync_corp_structures` — ежедневно. Синк Jita — условный: задача `sync_jita_book` выполняется только при добавленной и включённой локации Jita IV-4 (по умолчанию `station_id=60003760`), иначе ESI к рынку Jita не запрашивается. Каждая задача сама проверяет, истёк ли её интервал (`jita_sync_interval_min`, `stock_sync_interval_min`, `contracts_sync_interval_min` — из настроек плагина; 60 мин для `verify_providers`, 24 ч для ежедневных задач), поэтому интервалы меняются в UI без правки beat-расписания. Частый beat — намеренное решение ТЗ (§12.2): расписание остаётся фиксированным, а логика частоты живёт в настройках. Готовое расписание даёт фабрика `marketmonitoring.tasks.build_beat_schedule()` (см. [README.md](../README.md)).
+
+**Примечание (эррата к §9.4 и решениям №3/8/25/39 §20 ТЗ).** Решения §20 не пересматриваются: Jita — The Forge, станция 60003760 (`jita_station_id`, настраивается, №3); обновление Jita и доступности — Celery с настраиваемыми интервалами (№8); оверпрайс — по минимальной sell-цене Jita и порогу-проценту (№25); Jita — только источник цен докупки, а `K` считается по `L(S)` (№39). Буква §9.4 требует безусловно включать регион Jita в регионы синка; по явному указанию заказчика The Forge (`jita_region_id`) входит в набор только при добавленной и включённой локации `MarketLocation(kind=station, station_id=jita_station_id)` (Jita IV-4) в Locations UI, и только тогда запускается `sync_jita_book`. При удалённой/отключённой Jita ESI-запросов к рынку Jita нет ни в beat, ни при «Обновить сейчас»: `get_sync_region_ids()` жёстко выбрасывает The Forge даже при явном `scope_kind='region'/'system'`, `JitaOrderLevel` и `MarketOrderCache(region, jita_region_id)` удаляются. Недоступна только цена докупки (`unit/ref/cost/shortfall/overprice_pct` — `None`/`&mdash;`, `Fit.total_cost=None`, OVERPRICE и экспорт закупки пусты): карточка/Dashboard показывают `&mdash;` вместо `0 ISK`, уведомления о дефиците не содержат стоимость. Статус фита, `K`, `D_i` и контракты считаются по локальным рынкам; полный `NO_DATA` — только по §6.7. При выключенной Jita ручная цепочка состоит из 3 задач вместо 4 (без `sync_jita_book`). ТЗ не редактируется.
 
 Пример beat-расписания (обычно задаётся в `beat_schedule` проекта AA):
 
@@ -84,7 +88,7 @@ CELERYBEAT_SCHEDULE["marketmonitoring_sync"] = {
 
 На практике удобно завести одну запись на каждую задачу с именами:
 
-- `marketmonitoring.sync_jita_book`
+- `marketmonitoring.sync_jita_book` — только при включённой локации Jita IV-4; при отключённой кэш Jita очищается, цена докупки недоступна (`&mdash;`), статус фита считается по локальным рынкам
 - `marketmonitoring.sync_region_orders`
 - `marketmonitoring.sync_structure_orders`
 - `marketmonitoring.sync_contracts`
@@ -93,7 +97,7 @@ CELERYBEAT_SCHEDULE["marketmonitoring_sync"] = {
 - `marketmonitoring.cleanup_orphan_cache` — ежедневно (интервал 24 ч внутри задачи)
 - `marketmonitoring.sync_corp_structures` — ежедневно (решение №37 §20, guard 24 ч внутри задачи)
 
-Цепочка: `sync_*` → `recalc_stock_levels` → `notify_deficit`. Уведомления о дефиците (`deficit`, `contracts_deficit`, `ships_deficit`) отправляются только при `trigger=beat`; ручной запуск их не порождает (§12.4, этап 9 §21). Фабрика `build_beat_schedule()` уже включает `notify_deficit` наравне с задачами синка: при её использовании отдельная запись не требуется, а при собственном `CELERYBEAT_SCHEDULE` задачу нужно прописать явно (см. [README.md](../README.md)).
+Цепочка: `sync_*` → `recalc_stock_levels` → `notify_deficit`. В beat цепочка включает `sync_jita_book` только при включённой локации Jita IV-4. При «Обновить сейчас» запускаются `sync_region_orders`, `sync_structure_orders`, `sync_contracts` и затем `recalc_stock_levels`; `sync_jita_book` добавляется только при включённой локации Jita IV-4, поэтому при выключенной Jita ручная цепочка состоит из **3 задач вместо 4**. Уведомления о дефиците (`deficit`, `contracts_deficit`, `ships_deficit`) отправляются только при `trigger=beat`; ручной запуск их не порождает (§12.4, этап 9 §21). Фабрика `build_beat_schedule()` уже включает `notify_deficit` наравне с задачами синка: при её использовании отдельная запись не требуется, а при собственном `CELERYBEAT_SCHEDULE` задачу нужно прописать явно (см. [README.md](../README.md)).
 
 ### 6. Проверка установки
 
@@ -105,7 +109,8 @@ python manage.py check
 
 - в меню AA появились пункты **Market Monitoring** и **Components** (видны при наличии права view) и **Locations**/**Settings** (видны при `_edit`);
 - `python manage.py migrate` проходит без ошибок на чистой и существующей БД;
-- в `/admin/` доступны модели плагина (Market locations, Structure providers, Sync runs и др. — суперпользователю).
+- в `/admin/` доступны модели плагина (Market locations, Structure providers, Sync runs и др. — суперпользователю);
+- для цен докупки добавьте и включите локацию Jita IV-4 (`jita_station_id`, по умолчанию 60003760) на странице Locations — иначе цена докупки будет недоступна (`&mdash;`, `Fit.total_cost=None`, экспорт пуст), а статус фита будет считаться по локальным рынкам.
 
 ## Обновление
 

@@ -21,12 +21,12 @@
 ├──────────────────────┴───────────────────────────────────────────────────────┤
 │ FITS (card)                                                            (37)  │
 │ ┌──── sticky thead ─────────────────────────────────────────────────────────┐│
-│ │ Fit ▲ │ C/N │ Contr. │ Collect. K/N │ C+K │ Ships │ Status │ Buy ▼ │ Overp. │ Bottlen. │ Last ││
+│ │ Fit ▲ │ C/N │ Contr. │ Collect. (C+K) │ Ships │ Status │ Bottlen. │ Last ││
 │ ├───────────────────────────────────────────────────────────────────────────┤│
-│ │ My Logi│ 1/3 │ ●OK │ 2 of 3 ▓▓▓░ │ 3 │ ●ok      │ ●OK │ 145,200 │ — │ Nano   │ … ││
-│ │ My DPS │ 2/2 │ ●DEFICIT │ 0 of 2 ░░░░ │ 2 │ ●deficit │ ●DEFICIT │ 892,000 │ (2) │ → +4 │ … ││
-│ │ My Cas │ — │ ●NO_DATA │ 0 of 1 │ — │ ●no_data │ ●HULL_MISSING │ — │ — │ — │ … ││
-│ │ My Kite│ — │ ●NO_DATA │ — │ — │ ●no_data │ ●NO_DATA │ — │ — │ — │ … ││
+│ │ My Logi│ 1/3 │ ●OK │ 3 of 3 ▓▓▓▓ │ ●ok      │ ●OK │ Nano   │ … ││
+│ │ My DPS │ 2/2 │ ●DEFICIT │ 1 of 2 ▓▓░░ │ ●deficit │ ●DEFICIT │ → +4 │ … ││
+│ │ My Cas │ — │ ●NO_DATA │ — │ ●no_data │ ●HULL_MISSING │ — │ … ││
+│ │ My Kite│ — │ ●NO_DATA │ — │ ●no_data │ ●NO_DATA │ — │ … ││
 │ └───────────────────────────────────────────────────────────────────────────┘│
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -45,20 +45,15 @@
 3. **Фильтры** (col-md-8): один `<form method=get>`, selects: status / scope /
    bottleneck / sort. Кнопка Apply (`btn-outline-secondary`). Сортировка — select
    с вариантами по возрастанию/убыванию (текущая реализация сохраняется).
-4. **Таблица фитов**: `table-sm table-hover`, sticky thead. Имя фита — ссылка.
-   Колонка «Collectability» объединяет «K из N» + прогресс (см. README, раздел «Возможности»).
-   Отдельные колонки «Ships on contracts» (C/N), «Contracts status» и «Ships total (C+K)»;
-   рядом с итогом — бейдж общего статуса `ships_status_cache` (`ok` / `deficit` /
-   `no_data`). NO_DATA/HULL: прогресс не рисуем, «—» в сумме. При `no_data`
-   любого источника C или K итог и сводные счётчики для фита — «—».
+4. **Таблица фитов**: `table-sm table-hover`, sticky thead. «Collectability (C+K)» — единственная колонка итогового числа доступных кораблей: `C+K` из N с прогресс-баром, цвет которого берётся из общего статуса `ships_status_cache` (`ok`/`deficit`/`no_data`); бейдж того же статуса показан в колонке «Ships status». При `no_data` любого источника C или K — «—», прогресс не рисуется, рыночный `status_cache` в этой колонке не используется (§6.13, решения №40, №43). Отдельная колонка «Ships total (C+K)» удалена как дубль. Раздельные значения остаются в «Ships on contracts» (C/N) и «Ships from market (K/N, per fit)»; сводка по-прежнему показывает ∑C, ∑K **per fit** и ∑(C+K) только по фитам с известными обеими величинами. Столбцы «Total to buy» и «Overprice» из таблицы удалены по требованию пользователя; стоимость докупки и оверпрайс остаются доступны в карточке фита и в экспорте закупки.
 
 ## Состояния
 
 - Пусто (нет фитов): empty state, см. `07-states.md` §Empty.
 - Поллинг: кнопка disabled, spinner в статусе, авто-reload при успехе, alert-danger
   при ошибке (см. `07-states.md` §Polling).
-- Общий статус кораблей: в строке показываются только `ships_total` и бейдж
-  `ships_status_cache`; при `no_data` — «—» вместо C/K/C+K. Число агрегатного
+- Общий статус кораблей: в колонке Collectability показываются `ships_total` и бейдж
+  `ships_status_cache` (в колонке «Ships status»); при `no_data` — «—» вместо C+K. Число агрегатного
   дефицита `N−(C+K)` в строке дашборда не выводится — оно показывается в карточке
   фита (подробнее — `07-states.md` §1.1).
 - «Обновить сейчас» — **скрыт** для `view` (уже так: `{% if can_edit %}`).

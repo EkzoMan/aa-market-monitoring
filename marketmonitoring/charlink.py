@@ -26,7 +26,7 @@ CONTRACT_SCOPES = [
     "esi-contracts.read_corporation_contracts.v1",
     "esi-contracts.read_character_contracts.v1",
     # Структуры корпорации провайдера (решение №37 §20) — для sync_corp_structures.
-    "esi-corporations.read_corporation_structures.v1",
+    "esi-corporations.read_structures.v1",
 ]
 
 

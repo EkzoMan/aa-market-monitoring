@@ -13,6 +13,7 @@ from unittest import mock
 
 import pytest
 from allianceauth.eveonline.models import EveCharacter
+from django.contrib.auth.models import User
 from django.utils import timezone
 from esi.exceptions import HTTPClientError
 
@@ -64,6 +65,12 @@ def _raise_403(*args, **kwargs):
     raise _http_403()
 
 
+# Регрессия из боевого лога: локальный Django PK EveCharacter (1, 2, 4) отличается
+# от CCP character_id (2121551085), по которому AA ищет токены.
+LOCAL_PK_1, CCP_ID_1 = 71, 99100001
+LOCAL_PK_2, CCP_ID_2 = 72, 99100002
+
+
 @pytest.fixture(autouse=True)
 def _eager_celery(settings):
     """Тесты без сети: Celery-задачи в eager-режиме (без брокера)."""
@@ -113,18 +120,64 @@ def _provider(character_id: int, priority: int = 100, **kwargs) -> StructureProv
     return StructureProvider.objects.create(character=char, priority=priority, **kwargs)
 
 
+def _provider_with_ids(local_pk: int, ccp_id: int, priority: int = 100, **kwargs) -> StructureProvider:
+    """Провайдер с намеренно различными локальным PK и CCP character_id (регрессия токенов)."""
+    char = EveCharacter.objects.create(
+        pk=local_pk,
+        character_id=ccp_id,
+        character_name=f"Provider {ccp_id}",
+        corporation_id=98000001,
+        corporation_name="Corp",
+        corporation_ticker="CRP",
+    )
+    return StructureProvider.objects.create(character=char, priority=priority, **kwargs)
+
+
+def _make_provider_token(user: User, ccp_id: int):
+    """Валидный токен AA с обоими скоупами провайдера структур (без сети)."""
+    from allianceauth.eveonline.managers import EveCharacterManager  # noqa: PLC0415
+    from esi.models import Scope, Token  # noqa: PLC0415
+
+    scopes = [Scope.objects.get_or_create(name=name)[0] for name in esi_client.PROVIDER_SCOPES]
+
+    def _offline_character(character_id):
+        char = EveCharacter.objects.filter(character_id=character_id).first()
+        if char:
+            return char
+        return EveCharacter.objects.create(
+            character_id=character_id,
+            character_name=f"Provider {character_id}",
+            corporation_id=98000001,
+            corporation_name="Corp",
+            corporation_ticker="CRP",
+        )
+
+    with mock.patch.object(EveCharacterManager, "get_or_create_esi", side_effect=_offline_character):
+        token = Token.objects.create(
+            user=user,
+            character_id=ccp_id,
+            character_name=f"Provider {ccp_id}",
+            character_owner_hash=f"hash-{ccp_id}",
+        )
+    token.scopes.add(*scopes)
+    return token
+
+
 @pytest.mark.django_db
 def test_select_provider_by_priority(settings_row):
-    """Выбор по приоритету (§11): меньше priority = выше; при равенстве — по character_id."""
-    provider_high = _provider(99000001, priority=10)
-    _provider(99000002, priority=50)
+    """Выбор по приоритету (§11): меньше priority = выше; при равенстве — по CCP character_id.
+
+    Локальные PK намеренно идут в обратном порядке: сортировка не должна
+    маскироваться совпадением PK == CCP ID.
+    """
+    provider_high = _provider_with_ids(LOCAL_PK_2, CCP_ID_1, priority=10)
+    _provider_with_ids(LOCAL_PK_1, CCP_ID_2, priority=50)
     assert provider_service.select_provider(10221127) == provider_high
-    # Одинаковый приоритет → меньший character_id первым.
+    # Одинаковый приоритет → меньший CCP character_id первым, несмотря на локальные PK.
     provider_high.priority = 50
     provider_high.save(update_fields=["priority"])
     ordered = list(provider_service._available_providers())
-    # ordering по FK character_id (CCP character id); меньший CCP id первым.
-    assert [p.character.character_id for p in ordered] == [99000001, 99000002]
+    assert [p.character.character_id for p in ordered] == [CCP_ID_1, CCP_ID_2]
 
 
 @pytest.mark.django_db
@@ -200,15 +253,16 @@ def test_three_failures_disable_provider_and_alert_hook(settings_row):
 
 @pytest.mark.django_db
 def test_acl_alert_hook_guarded_import(settings_row):
-    """Точка вызова алерта защищена guarded import (этап 7): функция вызывается, если есть."""
-    provider = _provider(99000001)
+    """Точка вызова алерта защищена guarded import (этап 7); character_id — CCP ID, не локальный PK."""
+    provider = _provider_with_ids(LOCAL_PK_1, CCP_ID_1)
     sent = []
 
     fake_module = SimpleNamespace(send_provider_acl_lost=lambda **kwargs: sent.append(kwargs))
     with mock.patch.dict(sys.modules, {"marketmonitoring.notify.discord": fake_module}):
         provider_service.handle_acl_failure(provider)
     assert len(sent) == 1
-    assert sent[0]["character_id"] == provider.character_id
+    assert sent[0]["character_id"] == CCP_ID_1
+    assert sent[0]["character_id"] != provider.pk
     assert sent[0]["event"] == "provider_acl_lost"
     # Без функции в модуле — молча пропускается.
     empty_module = SimpleNamespace()
@@ -359,3 +413,118 @@ def test_acl_error_recorded_in_syncrun(settings_row, structure_location):
     run = SyncRun.objects.filter(task_name="marketmonitoring.sync_structure_orders").latest("started_at")
     assert run.status == SyncRunStatus.OK
     assert "ACL 403" in run.errors
+
+
+# ---------------------------------------------------------------------------
+# Регрессия: локальный PK EveCharacter != CCP character_id (боевой лог)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.django_db
+def test_get_provider_token_found_by_ccp_id_not_local_pk(db):
+    """Токен AA ищется по CCP character_id; локальный PK EveCharacter не подходит."""
+    user = User.objects.create_user(f"provider-token-{CCP_ID_1}", password="x")
+    token = _make_provider_token(user, CCP_ID_1)
+
+    assert esi_client.get_provider_token(CCP_ID_1) == token
+    assert esi_client.get_provider_token(LOCAL_PK_1) is None
+
+
+@pytest.mark.django_db
+def test_switch_to_next_provider_excludes_by_ccp_id(settings_row):
+    """Отказавшие провайдеры исключаются по CCP ID, а не по локальному PK (§11.2)."""
+    first = _provider_with_ids(LOCAL_PK_1, CCP_ID_1, priority=1)
+    second = _provider_with_ids(LOCAL_PK_2, CCP_ID_2, priority=2)
+    assert provider_service.select_provider(10221127) == first
+    assert provider_service.switch_to_next_provider(10221127, {CCP_ID_1}) == second
+    assert provider_service.switch_to_next_provider(10221127, {CCP_ID_2}) == first
+
+
+@pytest.mark.django_db
+def test_sync_structure_orders_resolves_token_by_ccp_id(settings_row, structure_location):
+    """Реальный путь ESI-клиента: токен находится по CCP ID, без «no valid token»."""
+    _provider_with_ids(LOCAL_PK_1, CCP_ID_1, priority=10)
+    user = User.objects.create_user(f"sync-token-{CCP_ID_1}", password="x")
+    token = _make_provider_token(user, CCP_ID_1)
+    assert esi_client.get_provider_token(CCP_ID_1) == token
+    assert esi_client.get_provider_token(LOCAL_PK_1) is None
+
+    class FakeResult:
+        def result(self, **kwargs):
+            return [_order()], SimpleNamespace(headers={"X-Pages": "1"})
+
+    fake_client = mock.Mock()
+
+    def _orders_op(**kwargs):
+        assert kwargs["token"].character_id == CCP_ID_1
+        return FakeResult()
+
+    fake_client.client.Market.GetMarketsStructuresStructureId.side_effect = _orders_op
+    with (
+        mock.patch.object(esi_client, "esi", fake_client),
+        mock.patch.object(esi_client, "fetch_structure_info", return_value={"name": "Fortizar Beta"}),
+    ):
+        result = tasks.sync_structure_orders(trigger=TriggerKind.MANUAL)
+
+    assert result["ok"] is True
+    assert result["locations_ok"] == 1
+    structure_location.refresh_from_db()
+    assert structure_location.sync_status == SyncStatus.OK
+    assert MarketOrderCache.objects.filter(
+        source_kind=SourceKind.STRUCTURE, source_ref=structure_location.structure_id
+    ).exists()
+    run = SyncRun.objects.filter(task_name="marketmonitoring.sync_structure_orders").latest("started_at")
+    assert "has no valid token" not in run.errors
+
+
+@pytest.mark.django_db
+def test_sync_structure_orders_passes_ccp_id_to_esi_calls(settings_row, structure_location):
+    """fetch_structure_orders/fetch_structure_info получают CCP ID, а не локальный PK."""
+    _provider_with_ids(LOCAL_PK_1, CCP_ID_1, priority=10)
+    with (
+        mock.patch.object(esi_client, "fetch_structure_orders", return_value=([_order()], False)) as fetch,
+        mock.patch.object(esi_client, "fetch_structure_info", return_value={"name": "Fortizar Beta"}) as info,
+    ):
+        result = tasks.sync_structure_orders(trigger=TriggerKind.MANUAL)
+
+    assert result["locations_ok"] == 1
+    fetch.assert_called_once_with(structure_location.structure_id, CCP_ID_1)
+    info.assert_called_once_with(structure_location.structure_id, CCP_ID_1)
+
+
+@pytest.mark.django_db
+def test_acl_failure_records_ccp_id_in_failed_set_logs_and_errors(settings_row, structure_location):
+    """403: failed_character_ids, логи и SyncRun.errors содержат CCP ID, не локальный PK."""
+    first = _provider_with_ids(LOCAL_PK_1, CCP_ID_1, priority=1)
+    second = _provider_with_ids(LOCAL_PK_2, CCP_ID_2, priority=2)
+    seen_failed: list[set[int]] = []
+    real_switch = provider_service.switch_to_next_provider
+
+    def _spy(structure_id, failed_character_ids):
+        seen_failed.append(set(failed_character_ids))
+        return real_switch(structure_id, failed_character_ids)
+
+    # Логгер marketmonitoring настроен с propagate=False — проверяем вызов напрямую.
+    with (
+        mock.patch.object(provider_service, "switch_to_next_provider", side_effect=_spy),
+        mock.patch.object(provider_service.logger, "info") as log_info,
+        mock.patch.object(esi_client, "fetch_structure_orders") as fetch,
+        mock.patch.object(esi_client, "fetch_structure_info", return_value={"name": "Fortizar Gamma"}),
+    ):
+        fetch.side_effect = [_http_403(), ([_order(volume=7)], False)]
+        result = tasks.sync_structure_orders(trigger=TriggerKind.MANUAL)
+
+    assert result["locations_ok"] == 1
+    assert seen_failed[0] == set()
+    assert seen_failed[1] == {CCP_ID_1}
+    first.refresh_from_db()
+    second.refresh_from_db()
+    assert first.acl_fail_count == 1
+    assert second.status == ProviderStatus.OK
+    run = SyncRun.objects.filter(task_name="marketmonitoring.sync_structure_orders").latest("started_at")
+    assert f"provider {CCP_ID_1} ACL 403" in run.errors
+    assert f"provider {LOCAL_PK_1} ACL 403" not in run.errors
+    assert any(
+        call.args and call.args[0].startswith("Provider %s cooling down") and call.args[1] == CCP_ID_1
+        for call in log_info.call_args_list
+    )

@@ -37,8 +37,10 @@ def calc_export_rows(fit: Fit) -> list[dict]:
     Расчёт идентичен карточке фита: общий селектор build_fit_component_rows
     (views/_calc_view.py) + calc/engine. При NO_DATA (протухшие данные,
     пустая область или отсутствие агрегата StockLevel — §6.4, §6.7)
-    дефицит/стоимость не считаются — экспорт пуст. При NOT_COVERED
-    qty = covered, дефицит возвращается отдельным полем shortfall. cost
+    дефицит/стоимость не считаются — экспорт пуст. При отключённой Jita
+    цена докупки недоступна: общий селектор не читает стакан, позиции не
+    экспортируются (ни stale-цен, ни нулевой стоимости).
+    При NOT_COVERED qty = covered, дефицит возвращается отдельным полем shortfall. cost
     каждой позиции — тот же, что в recalc_all (формула §6.9), поэтому
     сумма cost == Fit.total_cost. Возвращает список словарей: type_id,
     type_name, qty, unit_price (int ISK), cost (int ISK), shortfall.
@@ -46,7 +48,8 @@ def calc_export_rows(fit: Fit) -> list[dict]:
     settings_obj = PluginSetting.load()
     data = build_fit_component_rows(fit)
     # NO_DATA: дефицит/стоимость не считаются (§6.4) — экспорт пуст.
-    if data.any_no_data:
+    # Выключенная Jita: нет цены докупки — докупка не экспортируется.
+    if data.any_no_data or not data.jita_price_available:
         return []
     rows = []
     for component_input, calc_result in zip(data.component_inputs, data.calc_results):

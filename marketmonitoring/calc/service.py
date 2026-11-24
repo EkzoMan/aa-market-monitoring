@@ -21,6 +21,7 @@ from ..constants import (
     ShipsStatus,
     SyncStatus,
 )
+from ..esi.selectors import is_jita_enabled
 from ..models import (
     ComponentRequest,
     ContractCache,
@@ -417,14 +418,34 @@ def evaluate_fit_contracts(
 # ---------------------------------------------------------------------------
 
 
-def get_availability(type_id: int, scope_kind: str, scope_ref: int) -> tuple[int, bool]:
+def locations_with_stock(location_ids: set[int]) -> set[int]:
+    """Локации, по которым есть хотя бы один агрегат StockLevel (§6.7).
+
+    Один запрос без фильтра по типу: §6.7 требует наличия агрегата **по
+    локации**, а не по каждой паре (локация, тип). Отсутствие лотов конкретного
+    типа на свежей локации означает A=0, а не NO_DATA — иначе добавление новой
+    структуры в область превращало бы все фиты в NO_DATA.
+    """
+    if not location_ids:
+        return set()
+    return set(StockLevel.objects.filter(location_id__in=location_ids).values_list("location_id", flat=True).distinct())
+
+
+def get_availability(
+    type_id: int,
+    scope_kind: str,
+    scope_ref: int,
+    *,
+    present_locations: set[int] | None = None,
+) -> tuple[int, bool]:
     """Доступность A_t^S (§6.2) по агрегату StockLevel области.
 
     Строгий scope (§5.1): station — только заказы этой станции; system/region —
     NPC-станции + включённые структуры; order_range не используется (§5.8).
-    Возвращает (A, есть_ли_агрегат_StockLevel_по_ВСЕМ нужным локациям
-    области): NO_DATA, если агрегат отсутствует хотя бы по одной (§6.7).
-    Один запрос на компонент: строки читаются одним проходом.
+    Возвращает (A, есть_ли_данные_по_ВСЕМ нужным локациям): NO_DATA, если
+    агрегат StockLevel отсутствует хотя бы у одной локации области (§6.7).
+    При ``present_locations`` (пересчёт фита) проверка делается один раз на
+    все компоненты, без N+1 (§22.4); типа нет в локации → доступность 0.
     """
     location_ids = resolve_scope_ids(scope_kind, scope_ref)
     if not location_ids:
@@ -434,8 +455,9 @@ def get_availability(type_id: int, scope_kind: str, scope_ref: int) -> tuple[int
             "location_id", "total_sell_volume"
         )
     )
-    present = {location_id for location_id, _volume in rows}
-    has_data = present == location_ids
+    if present_locations is None:
+        present_locations = locations_with_stock(location_ids)
+    has_data = location_ids <= present_locations
     total = sum(volume for _location_id, volume in rows)
     return int(total), has_data
 
@@ -449,7 +471,12 @@ def get_jita_book(type_id: int, depth: int) -> tuple[list[OrderBookRow], Decimal
     """Стакан Jita: топ-depth sell-лотов ascending по цене + ref (мин. цена).
 
     UI никогда не обращается к ESI — читается только кэш JitaOrderLevel (§5.10).
+    Если локация Jita отключена/удалена, возвращает пустой стакан и ref=None:
+    даже при забытых строках кэша отключённый рынок не даёт stale-цену
+    (явное указание заказчика).
     """
+    if not is_jita_enabled():
+        return [], None
     rows = JitaOrderLevel.objects.filter(type_id=type_id).order_by("rank")[:depth]
     book = [OrderBookRow(price=row.price, volume=row.volume) for row in rows]
     ref = book[0].price if book else None
@@ -505,16 +532,25 @@ def _component_inputs(
     Возвращает ((ComponentInput, scope_kind, scope_ref, has_data), ...); область
     компонента — scope_override, иначе область фита (§6.3, решение 11).
     resolve_scope_ids кешируется в scope_cache (dict область → ids) — один
-    резолв на уникальную область фита; get_availability — один запрос на
-    компонент (без N+1, §22.4).
+    резолв на уникальную область фита; проверка наличия агрегатов (§6.7) —
+    один запрос на объединение локаций всех компонентов, без N+1 (§22.4).
     """
     result = []
     packaged_volumes = _packaged_volumes(refresh=False)
     has_data_flags = []
-    for component in fit.components.all().order_by("pk"):
+    components = list(fit.components.all().order_by("pk"))
+    needed_locations: set[int] = set()
+    for component in components:
         scope_kind = component.scope_override_kind or fit.scope_kind
         scope_ref = component.scope_override_ref if component.scope_override_kind else fit.scope_ref
-        availability, has_data = get_availability(component.type_id, scope_kind, scope_ref)
+        needed_locations |= _resolve_scope_cached(scope_cache, scope_kind, scope_ref)
+    present_locations = locations_with_stock(needed_locations)
+    for component in components:
+        scope_kind = component.scope_override_kind or fit.scope_kind
+        scope_ref = component.scope_override_ref if component.scope_override_kind else fit.scope_ref
+        availability, has_data = get_availability(
+            component.type_id, scope_kind, scope_ref, present_locations=present_locations
+        )
         has_data_flags.append(has_data)
         result.append(
             (
@@ -581,14 +617,18 @@ def recalc_fit(fit: Fit) -> FitCalcResult:
     контрактах (§6.12), затем рыночная собираемость компонентов (§6.1–§6.9).
     Нужные локации рынка — объединение областей всех компонентов с учётом override;
     при NO_DATA (§6.7) дефицит и стоимость не рассчитываются (§6.4). Дефицит —
-    независимо по каждому фиту (§5.5).
+    независимо по каждому фиту (§5.5). При выключенной Jita цена докупки
+    недоступна (None), но статус, K и D_i сохраняются (решение №43).
     """
     settings_obj = PluginSetting.load()
     scope_cache: dict[tuple[str, int], set[int]] = {}
     contracts_res, _matched_contracts, contracts_reasons = evaluate_fit_contracts(
         fit, settings_obj=settings_obj, scope_cache=scope_cache
     )
-    component_rows_data, all_components_have_data = _component_inputs(fit, scope_cache)
+    # Отдельный кеш: контрактная область (§6.12) и рыночная L(S) (§6.1) —
+    # разные множества локаций, хотя ключ у них один и тот же.
+    market_scope_cache: dict[tuple[str, int], set[int]] = {}
+    component_rows_data, all_components_have_data = _component_inputs(fit, market_scope_cache)
     component_rows = component_rows_data
     if not component_rows:
         # Без состава рыночная собираемость неизвестна — общий статус no_data (§6.13, §20.43).
@@ -626,7 +666,7 @@ def recalc_fit(fit: Fit) -> FitCalcResult:
     # резолв области кешируется на время пересчёта фита.
     needed_location_ids: set[int] = set()
     for _component_input, scope_kind, scope_ref, _has_data in component_rows:
-        needed_location_ids |= _resolve_scope_cached(scope_cache, scope_kind, scope_ref)
+        needed_location_ids |= _resolve_scope_cached(market_scope_cache, scope_kind, scope_ref)
     fresh, reasons = check_freshness(needed_location_ids, settings_obj.data_stale_after_min)
 
     if not all_components_have_data:
@@ -680,10 +720,14 @@ def recalc_fit(fit: Fit) -> FitCalcResult:
     depth = settings_obj.jita_book_depth
     books: dict[int, list[OrderBookRow]] = {}
     refs: dict[int, Decimal] = {}
-    for level in JitaOrderLevel.objects.filter(type_id__in=type_ids).order_by("type_id", "rank"):
-        book = books.setdefault(level.type_id, [])
-        if len(book) < depth:
-            book.append(OrderBookRow(price=level.price, volume=level.volume))
+    # Один .exists() на пересчёт: отключённая Jita не даёт цен даже из уцелевших
+    # строк кэша (stale-цена), но статус/K/D_i считаются по локальным рынкам.
+    jita_price_available = is_jita_enabled()
+    if jita_price_available:
+        for level in JitaOrderLevel.objects.filter(type_id__in=type_ids).order_by("type_id", "rank"):
+            book = books.setdefault(level.type_id, [])
+            if len(book) < depth:
+                book.append(OrderBookRow(price=level.price, volume=level.volume))
     for type_id, book in books.items():
         refs[type_id] = book[0].price
 
@@ -703,11 +747,14 @@ def recalc_fit(fit: Fit) -> FitCalcResult:
         for component_input, _k, _r, _d in component_rows
     ]
 
+    if not jita_price_available:
+        # Выключенная Jita: цена докупки недоступна, но статус/K/D_i не меняются.
+        results = [engine.price_unavailable(result) for result in results]
     hull_available_calc = next((c.availability for c in inputs if c.is_hull), 0)
     # Фит: ветвление с HULL_MISSING (§6.4).
     status = engine.calc_fit_status(False, hull_available_calc, k, fit.qty_target, allow_hull_missing=True)
-    total_cost = sum((r.cost for r in results), Decimal("0"))
-    overprice_count = sum(1 for r in results if r.is_overprice)
+    total_cost = None if not jita_price_available else sum((r.cost for r in results), Decimal("0"))
+    overprice_count = 0 if not jita_price_available else sum(1 for r in results if r.is_overprice)
     ships = get_ships_availability(
         fit,
         contracts_available=contracts_res.ships_available,

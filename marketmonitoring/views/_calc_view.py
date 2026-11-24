@@ -13,6 +13,7 @@ from decimal import Decimal
 from ..calc import engine
 from ..calc.engine import ComponentInput, OrderBookRow
 from ..calc.service import check_freshness, resolve_scope_ids
+from ..esi.selectors import is_jita_enabled
 from ..models import JitaOrderLevel, PluginSetting, StockLevel
 
 logger = logging.getLogger("marketmonitoring")
@@ -27,6 +28,8 @@ def build_component_request_rows(requests) -> list[dict]:
     по объединению локаций всех областей — если хотя бы одна нужная локация
     не свежа, все строки NO_DATA (дефицит/стоимость не считаются, §6.4).
     Компоненты вне фитов: HULL_MISSING не применяется (§6.10).
+    Если Jita отключена, ценовые поля обнуляются чистой функцией engine.price_unavailable:
+    дефицит и статус считаются по локальным рынкам, но cost становится None (не 0).
     Возвращает список словарей: obj, type_id, status, deficit, cost.
     """
     requests = list(requests)
@@ -44,14 +47,16 @@ def build_component_request_rows(requests) -> list[dict]:
 
     fresh, _reasons = check_freshness(location_union, settings_obj.data_stale_after_min)
 
-    # Одна выборка агрегатов StockLevel по всем типам и локациям (§22.4).
+    # Две пакетные выборки StockLevel: объёмы по нужным типам и наличие
+    # агрегата по локации (§6.7 — проверка на уровне локации, не типа).
     volume_by_key: dict[tuple[int, int], int] = {}
-    present_by_type: dict[int, set[int]] = defaultdict(set)
     for location_id, type_id, total in StockLevel.objects.filter(
         type_id__in=type_ids, location_id__in=location_union
     ).values_list("location_id", "type_id", "total_sell_volume"):
         volume_by_key[(location_id, type_id)] = total
-        present_by_type[type_id].add(location_id)
+    present_locations = set(
+        StockLevel.objects.filter(location_id__in=location_union).values_list("location_id", flat=True).distinct()
+    )
 
     # packaged_volume (§6.9) — из SDE через eveuniverse, один запрос.
     from eveuniverse.models import EveType
@@ -63,11 +68,14 @@ def build_component_request_rows(requests) -> list[dict]:
         packaged_volumes[type_id] = Decimal(str(packaged)) if packaged else Decimal(str(volume or 0))
 
     # Один запрос стакана Jita по всем типам (§22.4); rank=1 — минимальная цена.
+    # Отключённая Jita: стакан не читается даже при уцелевших строках кэша.
+    jita_price_available = is_jita_enabled()
     books: dict[int, list[OrderBookRow]] = defaultdict(list)
     refs: dict[int, Decimal] = {}
-    for level in JitaOrderLevel.objects.filter(type_id__in=type_ids).order_by("type_id", "rank"):
-        if len(books[level.type_id]) < settings_obj.jita_book_depth:
-            books[level.type_id].append(OrderBookRow(price=level.price, volume=level.volume))
+    if jita_price_available:
+        for level in JitaOrderLevel.objects.filter(type_id__in=type_ids).order_by("type_id", "rank"):
+            if len(books[level.type_id]) < settings_obj.jita_book_depth:
+                books[level.type_id].append(OrderBookRow(price=level.price, volume=level.volume))
     for type_id, book in books.items():
         refs[type_id] = book[0].price
 
@@ -75,7 +83,8 @@ def build_component_request_rows(requests) -> list[dict]:
     for request_obj in requests:
         ids = scope_ids[(request_obj.scope_kind, request_obj.scope_ref)]
         # Агрегат StockLevel должен быть по всем нужным локациям области (§6.7).
-        has_data = bool(ids) and present_by_type.get(request_obj.type_id, set()) == ids
+        # Нет лотов нужного типа на свежей локации → A=0, но не NO_DATA.
+        has_data = bool(ids) and ids <= present_locations
         if not fresh or not has_data:
             rows.append(
                 {
@@ -102,6 +111,8 @@ def build_component_request_rows(requests) -> list[dict]:
             delivery_rate=settings_obj.delivery_rate_isk_per_m3,
             overprice_threshold_pct=settings_obj.overprice_threshold_pct,
         )
+        if not jita_price_available:
+            result = engine.price_unavailable(result)
         # Компонент вне фитов: собираемость = доступность, HULL_MISSING не применяется (§6.10).
         status = engine.calc_fit_status(
             False, component.availability, component.availability, request_obj.qty_target, allow_hull_missing=False
@@ -135,10 +146,14 @@ class FitComponentRows:
         fresh: bool,
         reasons: list[str],
         type_names: dict[int, str],
+        jita_price_available: bool = True,
     ):
         self.components = components
         self.component_inputs = component_inputs
         self.calc_results = calc_results
+        # Цены Jita доступны только при включённой локации; при False карточка
+        # фита не должна показывать сохранённый Fit.total_cost (stale-цена).
+        self.jita_price_available = jita_price_available
         # Флаг NO_DATA по каждой позиции: протухшие данные (§6.7), пустая
         # область или отсутствие агрегата StockLevel по нужной локации (§6.7).
         self.component_no_data = component_no_data
@@ -159,6 +174,8 @@ def build_fit_component_rows(fit) -> FitComponentRows:
     (без N+1, §22.4) + чистые функции calc/engine. UI к ESI не обращается (§5.10).
     Позиция считается NO_DATA, если данные не свежи (§6.7), область пуста или
     агрегат StockLevel отсутствует хотя бы по одной нужной локации (§6.7).
+    При выключенной Jita ценовые поля обнуляются чистой функцией
+    engine.price_unavailable: K/D_i и статус остаются, цены — None.
     """
     from eveuniverse.models import EveType
 
@@ -188,19 +205,25 @@ def build_fit_component_rows(fit) -> FitComponentRows:
 
     fresh, reasons = check_freshness(location_union, settings_obj.data_stale_after_min)
     volume_by_key: dict[tuple[int, int], int] = {}
-    present_by_type: dict[int, set[int]] = defaultdict(set)
     for location_id, type_id, total in StockLevel.objects.filter(
         type_id__in=type_ids, location_id__in=location_union
     ).values_list("location_id", "type_id", "total_sell_volume"):
         volume_by_key[(location_id, type_id)] = total
-        present_by_type[type_id].add(location_id)
+    # §6.7: NO_DATA только если у локации нет агрегата StockLevel вообще;
+    # отсутствие лотов конкретного типа даёт A=0, а не NO_DATA.
+    present_locations = set(
+        StockLevel.objects.filter(location_id__in=location_union).values_list("location_id", flat=True).distinct()
+    )
 
     # Один запрос стакана Jita по всем типам (§22.4), rank=1 — минимальная цена.
+    # Gate по включённости локации: отключённая Jita не даёт stale-цен из кэша.
+    jita_price_available = is_jita_enabled()
     books: dict[int, list[OrderBookRow]] = defaultdict(list)
     refs: dict[int, Decimal] = {}
-    for level in JitaOrderLevel.objects.filter(type_id__in=type_ids).order_by("type_id", "rank"):
-        if len(books[level.type_id]) < settings_obj.jita_book_depth:
-            books[level.type_id].append(OrderBookRow(price=level.price, volume=level.volume))
+    if jita_price_available:
+        for level in JitaOrderLevel.objects.filter(type_id__in=type_ids).order_by("type_id", "rank"):
+            if len(books[level.type_id]) < settings_obj.jita_book_depth:
+                books[level.type_id].append(OrderBookRow(price=level.price, volume=level.volume))
     for type_id, book in books.items():
         refs[type_id] = book[0].price
 
@@ -229,9 +252,10 @@ def build_fit_component_rows(fit) -> FitComponentRows:
         )
         for component_input in component_inputs
     ]
+    if not jita_price_available:
+        calc_results = [engine.price_unavailable(result) for result in calc_results]
     component_no_data = [
-        not scope_ids[_scope_of(component)]
-        or present_by_type.get(component.type_id, set()) != scope_ids[_scope_of(component)]
+        not scope_ids[_scope_of(component)] or not scope_ids[_scope_of(component)] <= present_locations
         for component in components
     ]
     return FitComponentRows(
@@ -242,4 +266,5 @@ def build_fit_component_rows(fit) -> FitComponentRows:
         fresh=fresh,
         reasons=reasons,
         type_names=type_names,
+        jita_price_available=jita_price_available,
     )

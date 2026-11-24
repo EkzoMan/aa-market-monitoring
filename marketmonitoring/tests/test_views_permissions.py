@@ -10,7 +10,9 @@ from django.contrib.auth.models import Group, User
 from django.core.cache import cache
 from django.test import Client
 from django.urls import reverse
+from django.utils import timezone
 
+from ..constants import LocationKind, SyncStatus, TriggerKind
 from ..models import Fit, MarketLocation, PluginSetting, WebhookConfig
 from ..tasks import SYNC_LOCK_KEY
 from .test_calc_engine import sde_ids  # noqa: F401 — справочники eveuniverse
@@ -47,6 +49,33 @@ def fit_with_component(eve_types):  # noqa: F811
     fit = Fit.objects.create(name="Test fit", hull_type_id=643, qty_target=2, scope_kind="system", scope_ref=30000142)
     fit.components.create(type_id=2046, qty_per_fit=1)
     return fit
+
+
+def _set_jita_enabled(enabled: bool):
+    """Включить/отключить локацию-станцию Jita без ESI."""
+    settings_obj = PluginSetting.load()
+    location, _ = MarketLocation.objects.update_or_create(
+        kind=LocationKind.STATION,
+        station_id=settings_obj.jita_station_id,
+        defaults={
+            "name": "Jita IV-4",
+            "solar_system_id": 30000142,
+            "region_id": settings_obj.jita_region_id,
+            "enabled": enabled,
+            "sync_status": SyncStatus.OK if enabled else SyncStatus.STALE,
+            "last_synced_at": timezone.now() if enabled else None,
+        },
+    )
+    return location
+
+
+def _delay_spy(name, called):
+    """Мок .delay(), запоминающий имя задачи, trigger и токен блокировки."""
+
+    def _delay(trigger, lock_token=None):
+        called.append((name, trigger, lock_token))
+
+    return _delay
 
 
 # ---------------------------------------------------------------------------
@@ -289,36 +318,51 @@ def test_refresh_status_shows_lock(viewer_client):
         cache.delete(SYNC_LOCK_KEY)
 
 
-def test_refresh_returns_409_when_locked(editor_client):
+def test_refresh_returns_409_when_locked(editor_client, monkeypatch):
     """«Обновить сейчас» при занятой блокировке — 409 (§12.4); задачи не запускаются повторно."""
     cache.set(SYNC_LOCK_KEY, "1234567890.0", timeout=60)
+    called = []
+    for name in ("sync_jita_book", "sync_region_orders", "sync_structure_orders", "sync_contracts"):
+        monkeypatch.setattr(
+            f"marketmonitoring.views.refresh.{name}",
+            type("T", (), {"delay": staticmethod(_delay_spy(name, called))}),
+        )
     try:
         response = editor_client.post(reverse("marketmonitoring:refresh"))
         assert response.status_code == 409
+        assert called == []
     finally:
         cache.delete(SYNC_LOCK_KEY)
 
 
-def test_refresh_starts_chain(editor_client, monkeypatch):
-    """Свободная блокировка: цепочка sync_* ставится с trigger=manual и токеном блокировки (§12.4, §12.3)."""
-    from django.core.cache import cache
-
+@pytest.mark.parametrize(
+    "jita_enabled,expected_names",
+    [
+        (True, ("sync_jita_book", "sync_region_orders", "sync_structure_orders", "sync_contracts")),
+        (False, ("sync_region_orders", "sync_structure_orders", "sync_contracts")),
+    ],
+)
+def test_refresh_starts_chain(editor_client, monkeypatch, jita_enabled, expected_names):
+    """Свободная блокировка: sync_* с trigger=manual и общим токеном; Jita — только если включена."""
     cache.delete(SYNC_LOCK_KEY)
+    _set_jita_enabled(jita_enabled)
     called = []
-
-    def _fake_delay(trigger, lock_token=None):
-        called.append((trigger, lock_token))
-
-    for name in ("sync_contracts",):
+    all_names = ("sync_jita_book", "sync_region_orders", "sync_structure_orders", "sync_contracts")
+    for name in all_names:
         monkeypatch.setattr(
-            f"marketmonitoring.views.refresh.{name}", type("T", (), {"delay": staticmethod(_fake_delay)})
+            f"marketmonitoring.views.refresh.{name}",
+            type("T", (), {"delay": staticmethod(_delay_spy(name, called))}),
         )
-    response = editor_client.post(reverse("marketmonitoring:refresh"))
-    assert response.status_code == 302
-    lock_value = cache.get(SYNC_LOCK_KEY)
-    assert lock_value is not None
-    # Рыночные синки временно отключены: в цепочке только sync_contracts.
-    assert called == [("manual", lock_value)]
+    try:
+        response = editor_client.post(reverse("marketmonitoring:refresh"))
+        assert response.status_code == 302
+        lock_value = cache.get(SYNC_LOCK_KEY)
+        assert lock_value is not None
+        assert called == [(name, TriggerKind.MANUAL, lock_value) for name in expected_names]
+        if not jita_enabled:
+            assert all(name != "sync_jita_book" for name, _trigger, _token in called)
+    finally:
+        cache.delete(SYNC_LOCK_KEY)
 
 
 def test_refresh_chain_releases_lock(editor_client, monkeypatch):

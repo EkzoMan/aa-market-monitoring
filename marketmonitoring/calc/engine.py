@@ -6,7 +6,7 @@
 view и tasks их вызывают (§22.3).
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import ROUND_HALF_UP, Decimal
 
 # Статусы фита (§6.4); значения совпадают с marketmonitoring.constants.FitStatus.
@@ -76,9 +76,10 @@ class ComponentCalcResult:
     deficit: int
     unit: Decimal | None
     ref: Decimal | None
-    cost: Decimal
+    # Цена докупки отсутствует, когда рынок цены недоступен (выключенная Jita).
+    cost: Decimal | None
     is_not_covered: bool
-    shortfall: int
+    shortfall: int | None
     is_overprice: bool
     # Процент превышения unit над ref (§6.8) для tooltip бейджа; None при отсутствии данных.
     overprice_pct: Decimal | None = None
@@ -234,6 +235,26 @@ def calc_component(
         shortfall=price.shortfall,
         is_overprice=overpriced,
         overprice_pct=calc_overprice_pct(price.unit, ref_price),
+    )
+
+
+def price_unavailable(result: ComponentCalcResult) -> ComponentCalcResult:
+    """Обнуляет только ценовые поля позиции, когда рынок цены недоступен.
+
+    Чистая функция: дефицит D_i, доступность A_i, qty_per_fit и статус фита
+    остаются прежними (C/K и уведомления по решению №43 не теряются).
+    ``unit/ref/cost/shortfall/overprice_pct`` становятся None, бейджи
+    NOT_COVERED и OVERPRICE сбрасываются — ни stale-цен, ни нулевой стоимости.
+    """
+    return replace(
+        result,
+        unit=None,
+        ref=None,
+        cost=None,
+        shortfall=None,
+        overprice_pct=None,
+        is_not_covered=False,
+        is_overprice=False,
     )
 
 

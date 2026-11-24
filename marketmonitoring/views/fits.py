@@ -484,9 +484,13 @@ def fit_detail(request, fit_id: int):
             }
         )
 
-    display_total = (
-        fit.total_cost if fit.status_cache == status else sum((r.cost for r in data.calc_results), Decimal("0"))
-    )
+    # Отключённая Jita: цена докупки недоступна — None, не stale и не сумма нулей.
+    if not data.jita_price_available:
+        display_total = None
+    elif fit.status_cache == status:
+        display_total = fit.total_cost
+    else:
+        display_total = sum((r.cost for r in data.calc_results), Decimal("0"))
 
     contract_rows = [{"contract": contract, "ships_count": ships_count} for contract, ships_count in matched_contracts]
 
@@ -518,7 +522,7 @@ def fit_detail(request, fit_id: int):
         "reasons": data.reasons if no_data else [],
         "rows": rows,
         # Счётчики шапки (02-fit-detail.md): оверпрайс-позиции и строки с дефицитом.
-        "overprice_count": fit.overprice_count or 0,
+        "overprice_count": (fit.overprice_count or 0) if data.jita_price_available else 0,
         "deficit_lines": sum(
             1 for row in rows if not row["no_data"] and row["deficit"] is not None and row["deficit"] > 0
         ),

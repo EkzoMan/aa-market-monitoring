@@ -3,6 +3,7 @@
 Тесты без сети: только БД плагина и справочники eveuniverse.
 """
 
+import re
 from decimal import Decimal
 
 import pytest
@@ -12,8 +13,10 @@ from django.urls import reverse
 
 from ..auth_hooks import GROUP_EDIT, GROUP_VIEW
 from ..models import Fit
+from ..views import dashboard as dashboard_view
 from .test_calc_engine import sde_ids  # noqa: F401 — справочники eveuniverse (система/станции)
 from .test_eft_parser import eve_types  # noqa: F401 — записи EveType
+from .test_ships_availability import _no_esi, _seed_full_kit_contracts, _seed_reference_market
 
 pytestmark = pytest.mark.django_db
 
@@ -66,6 +69,13 @@ def fit_with_component(eve_types, sde_ids):  # noqa: F811
 # ---------------------------------------------------------------------------
 
 
+def _dashboard_cell(html, column_index):
+    """Ячейка <td> первой строки таблицы фитов дашборда по нумерации колонок."""
+    tbody = html.split("<tbody>", 1)[1].split("</tbody>", 1)[0]
+    first_row = tbody.split("<tr>", 1)[1].split("</tr>", 1)[0]
+    return re.findall(r"<td[^>]*>(.*?)</td>", first_row, flags=re.S)[column_index]
+
+
 def test_dashboard_uses_semantic_bootstrap_badges(viewer_client, fit_with_component):
     """Палитра статусов — только семантические токены Bootstrap (README §1), без жёстких hex-классов."""
     response = viewer_client.get(reverse("marketmonitoring:index"))
@@ -73,7 +83,7 @@ def test_dashboard_uses_semantic_bootstrap_badges(viewer_client, fit_with_compon
     assert response.status_code == 200
     assert "text-bg-success" in content  # статус ok
     assert "mm-badge-ok" not in content  # старые hex-классы удалены
-    assert "mm-progress" in content  # тонкий прогресс «K из N»
+    assert "mm-progress" in content  # тонкий прогресс в колонках C/K и Collectability (C+K)
     assert "mm-num" in content  # числовая типографика
     assert "marketmonitoring/css/mm.css" in content  # utility-CSS подключён
 
@@ -83,6 +93,83 @@ def test_dashboard_hidden_edit_elements_for_view_role(viewer_client, fit_with_co
     content = viewer_client.get(reverse("marketmonitoring:index")).content.decode()
     assert '<button type="submit" id="mm-refresh-btn"' not in content
     assert "New fit" not in content
+
+
+def test_dashboard_collectability_is_c_plus_k(viewer_client, sde_ids):  # noqa: F811
+    """Collectability показывает C+K и цвет общего статуса, а не рыночный K (решение №40)."""
+    from ..calc import service as calc_service
+
+    fit = _seed_reference_market(sde_ids, name="Collectability C+K", qty_target=20)
+    _seed_full_kit_contracts(fit, 3)  # C=3, K=10 -> C+K=13
+    calc_service.recalc_fit(fit)
+
+    with _no_esi():
+        html = viewer_client.get(reverse("marketmonitoring:index")).content.decode()
+
+    assert "Collectability (C+K)" in html
+    assert "Ships total (C+K)" not in html
+    cell = _dashboard_cell(html, 1)
+    cell_text = " ".join(re.sub(r"<[^>]+>", " ", cell).split())
+    assert cell_text.startswith("13 of 20")
+    assert "10 of 20" not in cell_text
+    assert "width: 65%" in cell
+    assert "bg-warning" in cell
+
+
+def test_dashboard_collectability_no_data_is_dash(viewer_client, sde_ids):  # noqa: F811
+    """Без данных контрактов Collectability — «—», без прогресса (решение №43)."""
+    from ..calc import service as calc_service
+
+    fit = _seed_reference_market(sde_ids, name="Collectability no data", qty_target=20)
+    calc_service.recalc_fit(fit)  # нет ContractProvider -> C=None
+    fit.refresh_from_db()
+    assert fit.contracts_available is None
+
+    with _no_esi():
+        html = viewer_client.get(reverse("marketmonitoring:index")).content.decode()
+    cell = _dashboard_cell(html, 1)
+    assert "&mdash;" in cell
+    assert "progress" not in cell
+    assert "width:" not in cell
+
+
+def test_dashboard_has_no_total_to_buy_or_overprice_columns(viewer_client, fit_with_component):
+    """Столбцы «Total to buy» и «Overprice» удалены из таблицы дашборда."""
+    content = viewer_client.get(reverse("marketmonitoring:index")).content.decode()
+    assert "Total to buy" not in content
+    assert "Overprice" not in content
+    tbody = content.split("<tbody>", 1)[1].split("</tbody>", 1)[0]
+    first_row = tbody.split("<tr>", 1)[1].split("</tr>", 1)[0]
+    assert len(re.findall(r"<td\b", first_row)) == 9
+
+
+def test_dashboard_ships_availability_without_n_plus_one(viewer_client, sde_ids, monkeypatch):  # noqa: F811
+    """Сводка C+K читается ровно один раз на фит, без повторных вызовов в цикле (§22.4)."""
+    from ..constants import ScopeKind
+
+    fits = [
+        Fit.objects.create(
+            name=f"N+1 fit {index}",
+            hull_type_id=1,
+            qty_target=5,
+            scope_kind=ScopeKind.STATION,
+            scope_ref=60003760,
+        )
+        for index in range(3)
+    ]
+    original = dashboard_view.get_ships_availability
+    calls = []
+
+    def counting_get_ships_availability(fit):
+        calls.append(fit.pk)
+        return original(fit)
+
+    monkeypatch.setattr(dashboard_view, "get_ships_availability", counting_get_ships_availability)
+    with _no_esi():
+        response = viewer_client.get(reverse("marketmonitoring:index"))
+
+    assert response.status_code == 200
+    assert sorted(calls) == sorted(fit.pk for fit in fits)
 
 
 def test_dashboard_edit_controls_for_edit_role(editor_client, fit_with_component):
@@ -115,6 +202,28 @@ def _add_stock(location_id, type_id, volume):
         },
     )
     return stock
+
+
+def _enable_jita_location():
+    """Явно включить локацию Jita: стакан читается только при enabled=True (§12.1)."""
+    from django.utils import timezone
+
+    from ..constants import LocationKind, SyncStatus
+    from ..models import MarketLocation, PluginSetting
+
+    settings_obj = PluginSetting.load()
+    MarketLocation.objects.update_or_create(
+        kind=LocationKind.STATION,
+        station_id=settings_obj.jita_station_id,
+        defaults={
+            "name": "Jita IV-4",
+            "solar_system_id": 30000142,
+            "region_id": settings_obj.jita_region_id,
+            "enabled": True,
+            "sync_status": SyncStatus.OK,
+            "last_synced_at": timezone.now(),
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -152,6 +261,7 @@ def test_fit_detail_overprice_badge(editor_client, eve_types, sde_ids):  # noqa:
     )
     fit.components.create(type_id=643, qty_per_fit=1)  # корпус — достаток, без флага
     fit.components.create(type_id=2046, qty_per_fit=1)
+    _enable_jita_location()  # без включённой локации стакан не читается
     _add_stock(60003760, 643, 3)
     _add_stock(60003761, 643, 3)  # 6 ≥ 5 — корпус не дефицитен
     _add_stock(60003760, 2046, 1)
@@ -165,6 +275,26 @@ def test_fit_detail_overprice_badge(editor_client, eve_types, sde_ids):  # noqa:
 
     content = editor_client.get(reverse("marketmonitoring:fit_detail", args=[fit.pk])).content.decode()
     assert "OVERPRICE" in content
+
+
+def test_disabled_jita_shows_dash_instead_of_zero(viewer_client, fit_with_component):  # noqa: F811
+    """Выключенная Jita: дашборд и карточка показывают &mdash;, а не «0 ISK»."""
+    from ..calc import service as calc_service
+    from ..constants import FitStatus
+
+    result = calc_service.recalc_fit(fit_with_component)
+    fit_with_component.refresh_from_db()
+    assert result.status == FitStatus.OK
+    assert result.k == 4
+    assert result.total_cost is None and fit_with_component.total_cost is None
+
+    index_content = viewer_client.get(reverse("marketmonitoring:index")).content.decode()
+    detail_url = reverse("marketmonitoring:fit_detail", args=[fit_with_component.pk])
+    detail_content = viewer_client.get(detail_url).content.decode()
+    assert "&mdash;" in index_content
+    assert "&mdash;" in detail_content
+    assert "0 ISK" not in index_content
+    assert "0 ISK" not in detail_content
 
 
 def test_dashboard_denied_without_view_group(db):

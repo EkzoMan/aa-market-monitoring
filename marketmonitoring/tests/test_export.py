@@ -17,6 +17,7 @@ from django.utils import timezone
 from ..auth_hooks import GROUP_VIEW
 from ..calc.service import recalc_fit
 from ..constants import LocationKind, SyncStatus
+from ..views.exports import calc_export_rows
 from ..models import Fit, FitComponent, JitaOrderLevel, MarketLocation, StockLevel
 from .test_eft_parser import eve_types  # noqa: F401 — фикстура EveType записей
 
@@ -191,6 +192,19 @@ def test_export_multibuy_endpoint(eve_types, viewer_client, db):  # noqa: F811
     data = response.json()
     assert data["empty"] is True
     assert data["text"] == ""
+
+
+def test_calc_export_rows_empty_when_jita_disabled(eve_types, db):  # noqa: F811
+    """Выключенная Jita: закупка недоступна — calc_export_rows возвращает [].
+
+    Локальный дефицит и StockLevel остаются свежими: пустой экспорт вызван
+    именно отсутствием цены докупки, а не NO_DATA рыночных локаций.
+    """
+    _seed_market(db)
+    fit = _deficit_fit(db)
+    MarketLocation.objects.filter(station_id=STATION_ID).update(enabled=False)
+
+    assert calc_export_rows(fit) == []
 
 
 def test_export_empty_deficit_files(eve_types, viewer_client, db):  # noqa: F811

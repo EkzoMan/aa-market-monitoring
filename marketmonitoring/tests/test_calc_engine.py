@@ -375,6 +375,63 @@ def _add_jita_levels(type_id, lots):
 
 
 @pytest.mark.django_db
+def test_service_get_jita_book_disabled_location_ignores_cache(sde_ids):
+    """Отключённая локация Jita: сервис не отдаёт stale-лоты даже при уцелевших строках кэша."""
+    location = _make_location_fresh(60003760)
+    _add_jita_levels(1, [("40000000", 5), ("42000000", 15)])
+    depth = PluginSetting.load().jita_book_depth
+
+    book, ref = calc_service.get_jita_book(1, depth)
+    assert ref == D("40000000")
+    assert len(book) == 2
+    assert isinstance(book[0].price, Decimal)
+
+    MarketLocation.objects.filter(pk=location.pk).update(enabled=False)
+    assert calc_service.get_jita_book(1, depth) == ([], None)
+
+
+@pytest.mark.django_db
+def test_service_disabled_jita_keeps_market_calc_without_prices(sde_ids):  # noqa: F811
+    """Выключенная Jita: K/D_i/статус остаются по локальным рынкам, цены — None."""
+    settings = PluginSetting.load()
+    settings.jita_markup_pct = D("5")
+    settings.overprice_threshold_pct = D("25")
+    settings.delivery_rate_isk_per_m3 = D("1250")
+    settings.save()
+    fit = _fit_with_components()
+    _add_stock(60003760, 1, 10)
+    _add_stock(60003760, 2, 100)
+    _add_stock(60003760, 3, 10000)
+    _add_jita_levels(1, [("40000000", 5), ("42000000", 15)])
+    _add_jita_levels(3, [("1000", 10000), ("1200", 10000)])
+
+    baseline = calc_service.recalc_fit(fit)
+    assert baseline.total_cost == D("1269912500")
+
+    MarketLocation.objects.filter(station_id=60003760).update(enabled=False)
+    result = calc_service.recalc_fit(fit)
+    fit.refresh_from_db()
+
+    # Jita — только источник цен: возврат к локальным рынкам, не полный NO_DATA.
+    assert result.status == FitStatus.DEFICIT
+    assert result.k == 10
+    assert [c.deficit for c in result.components] == [20, 0, 20000]
+    assert fit.status_cache == FitStatus.DEFICIT
+    assert fit.fits_available == 10
+    assert result.total_cost is None and fit.total_cost is None
+    assert result.overprice_count == 0
+    assert {c.type_id for c in result.components} == {1, 2, 3}
+    for component in result.components:
+        assert component.unit is None
+        assert component.ref is None
+        assert component.cost is None
+        assert component.shortfall is None
+        assert component.is_not_covered is False
+        assert component.is_overprice is False
+        assert component.overprice_pct is None
+
+
+@pytest.mark.django_db
 def test_service_reference_full(sde_ids):
     """Эталон §6.11 через сервис: status=DEFICIT, K=10, Total ровно."""
     settings = PluginSetting.load()
@@ -403,11 +460,12 @@ def test_service_reference_full(sde_ids):
 
 
 def test_service_no_data_missing_stock(sde_ids):
-    """NO_DATA при отсутствии данных по нужной локации (§18.4, §6.7)."""
+    """NO_DATA при отсутствии агрегата StockLevel по нужной локации (§18.4, §6.7)."""
     fit = _fit_with_components()
     _add_stock(60003760, 1, 10)
     _add_stock(60003760, 2, 100)
-    # Заряды: агрегата StockLevel нет вообще.
+    # У локации нет ни одного агрегата — данные по ней не синкались.
+    StockLevel.objects.filter(location_id=60003760).delete()
     _add_jita_levels(1, [("40000000", 5)])
     calc_service.recalc_fit(fit)
     fit.refresh_from_db()
@@ -590,6 +648,37 @@ def test_no_data_when_aggregate_missing_at_one_location(sde_ids):
     assert fit.status_cache == FitStatus.NO_DATA
     assert fit.fits_available is None and fit.total_cost is None
     assert any("no StockLevel aggregate" in reason for reason in result.reasons)
+
+
+def test_new_structure_without_type_orders_does_not_void_all_fits(sde_ids):
+    """Регресс: свежая структура без лотов нужного типа даёт A=0, а не NO_DATA (§6.7).
+
+    До исправления проверка требовала агрегат StockLevel по каждой паре
+    (локация, тип): добавление структуры в область превращало все компоненты
+    в NO_DATA, даже если на старых локациях данные есть.
+    """
+    fit = _make_fit(n=1, scope_kind=ScopeKind.SYSTEM, scope_ref=30000142)
+    FitComponent.objects.create(fit=fit, type_id=1, qty_per_fit=1)
+    FitComponent.objects.create(fit=fit, type_id=3, qty_per_fit=1000)
+    _make_location_fresh(60003760)
+    _make_location_fresh(60003761)
+    _make_location_fresh(70000001, kind=LocationKind.STRUCTURE)
+    # У структуры есть данные (тип 1), но нет лотов зарядов (тип 3).
+    _add_stock(60003760, 1, 10)
+    _add_stock(60003760, 3, 10000)
+    _add_stock(60003761, 1, 10)
+    _add_stock(60003761, 3, 1000)
+    _add_stock(70000001, 1, 10)
+
+    availability, has_data = calc_service.get_availability(3, ScopeKind.SYSTEM, 30000142)
+    assert has_data is True
+    assert availability == 11000
+
+    result = calc_service.recalc_fit(fit)
+    fit.refresh_from_db()
+    assert fit.status_cache == FitStatus.OK
+    assert fit.fits_available == 11
+    assert result.reasons == []
 
 
 def test_regional_check_not_applied_to_structures(sde_ids):

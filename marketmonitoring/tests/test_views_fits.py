@@ -8,7 +8,6 @@ from django.urls import reverse
 from ..auth_hooks import GROUP_EDIT, GROUP_VIEW
 from ..models import Fit, FitComponent
 from .test_calc_engine import sde_ids  # noqa: F401 — справочник eveuniverse (система 30000142)
-from .test_calc_engine import sde_ids  # noqa: F401 — справочник eveuniverse (система 30000142)
 from .test_eft_parser import eve_types  # noqa: F401 — фикстура EveType записей
 
 pytestmark = pytest.mark.django_db

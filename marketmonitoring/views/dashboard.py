@@ -90,14 +90,16 @@ def _bottlenecks_by_fit(fits_list: list[Fit]) -> dict[int, list[int]]:
     for ids in scope_ids_by_key.values():
         location_union |= ids
 
-    # Одна выборка агрегатов StockLevel по всем типам и локациям областей.
+    # Пакетные выборки StockLevel: объёмы по типам и наличие агрегата по
+    # локации (§6.7 — проверка на уровне локации, не типа).
     volume_by_key: dict[tuple[int, int], int] = {}
-    present_by_type: dict[int, set[int]] = defaultdict(set)
     for location_id, type_id, total in StockLevel.objects.filter(
         type_id__in=type_ids, location_id__in=location_union
     ).values_list("location_id", "type_id", "total_sell_volume"):
         volume_by_key[(location_id, type_id)] = total
-        present_by_type[type_id].add(location_id)
+    present_locations = set(
+        StockLevel.objects.filter(location_id__in=location_union).values_list("location_id", flat=True).distinct()
+    )
 
     bottlenecks: dict[int, list[int]] = {}
     for fit in fits_list:
@@ -106,7 +108,7 @@ def _bottlenecks_by_fit(fits_list: list[Fit]) -> dict[int, list[int]]:
             scope = _fit_scope(fit, component)
             ids = scope_ids_by_key[scope]
             availability = sum(volume_by_key.get((location_id, component.type_id), 0) for location_id in ids)
-            has_data = bool(ids) and present_by_type.get(component.type_id, set()) == ids
+            has_data = bool(ids) and ids <= present_locations
             inputs.append(
                 ComponentInput(type_id=component.type_id, qty_per_fit=component.qty_per_fit, availability=availability)
             )

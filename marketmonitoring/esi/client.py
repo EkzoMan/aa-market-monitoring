@@ -18,7 +18,7 @@ from esi.exceptions import ESIErrorLimitException, HTTPClientError, HTTPServerEr
 from esi.models import Token
 from esi.openapi_clients import ESIClientProvider
 
-from ..constants import ContractSourceKind
+from ..constants import ContractSourceKind, SourceKind
 from ..models import PluginSetting
 
 logger = logging.getLogger("marketmonitoring")
@@ -37,9 +37,12 @@ SCOPE_CORP_CONTRACTS = "esi-contracts.read_corporation_contracts.v1"
 SCOPE_CHAR_CONTRACTS = "esi-contracts.read_character_contracts.v1"
 
 # Скоуп списка структур корпорации провайдера (решение №37 §20).
-# Официальная спека ESI указывает другой scope; расхождение зафиксировано
-# отдельно без пересмотра решения №37.
-SCOPE_CORP_STRUCTURES = "esi-corporations.read_corporation_structures.v1"
+# Техническая эррата: решение №37 сохраняется — тот же эндпоинт
+# GET /corporations/{id}/structures/, beat раз в сутки, MarketLocation(kind=structure,
+# enabled=false) с ручным включением и ACL §11. В тексте ТЗ указан несуществующий
+# идентификатор scope; в коде используется фактический scope из официальной спекы ESI
+# (https://esi.evetech.net/meta/openapi.json). ТЗ не редактируется.
+SCOPE_CORP_STRUCTURES = "esi-corporations.read_structures.v1"
 
 # Порог заголовка X-ESI-Error-Limit-Remain (§9.2).
 ERROR_LIMIT_REMAIN_THRESHOLD = 10
@@ -370,16 +373,49 @@ def build_order_cache_rows(
     *,
     source_kind: str,
     source_ref: int,
+    solar_system_id: int | None = None,
+    region_id: int | None = None,
 ) -> list[dict]:
     """Преобразование сырых заказов ESI в строки MarketOrderCache (без записи в БД).
 
     Фильтруются только sell-заказы (is_buy_order=False); fetched_at — момент синка.
+    Поле ESI называется ``solar_system_id``; ``system_id`` поддерживается только
+    для совместимости со старыми ответами/моками. В ответе
+    ``/markets/structures/{structure_id}/orders/`` нет ни системы, ни региона —
+    вызывающий обязан передать их из ``MarketLocation``. Для структур ``source_ref``
+    является structure_id и никогда не подставляется как region_id.
+    Строки без system/region пропускаются; предупреждение пишется один раз на вызов.
     """
 
     now = timezone.now()
     rows: list[dict] = []
+    warned_system = False
+    warned_region = False
     for order in orders:
         if _order_field(order, "is_buy_order", False):
+            continue
+        row_system_id = _order_field(order, "solar_system_id") or _order_field(order, "system_id") or solar_system_id
+        if row_system_id is None:
+            if not warned_system:
+                logger.warning(
+                    "build_order_cache_rows: skip orders without solar_system_id (source=%s/%s)",
+                    source_kind,
+                    source_ref,
+                )
+                warned_system = True
+            continue
+        row_region_id = _order_field(order, "region_id") or region_id
+        if row_region_id is None and source_kind == SourceKind.REGION:
+            # Только для регионального источника source_ref — это region_id.
+            row_region_id = source_ref
+        if row_region_id is None:
+            if not warned_region:
+                logger.warning(
+                    "build_order_cache_rows: skip orders without region_id (source=%s/%s)",
+                    source_kind,
+                    source_ref,
+                )
+                warned_region = True
             continue
         volume = _order_field(order, "volume_remain", None)
         if volume is None:
@@ -389,8 +425,8 @@ def build_order_cache_rows(
                 "source_kind": source_kind,
                 "source_ref": source_ref,
                 "location_id": _order_field(order, "location_id"),
-                "solar_system_id": _order_field(order, "system_id"),
-                "region_id": _order_field(order, "region_id") or source_ref,
+                "solar_system_id": row_system_id,
+                "region_id": row_region_id,
                 "type_id": _order_field(order, "type_id"),
                 "price": _order_field(order, "price"),
                 "volume": int(volume or 0),
@@ -471,7 +507,7 @@ def _token_for_corp_structures(character_id: int) -> Token:
 def fetch_corporation_structures(corporation_id: int, character_id: int) -> tuple[list[dict], bool]:
     """Структуры корпорации постранично (§9.1, решение №37 §20).
 
-    Скоуп: ``esi-corporations.read_corporation_structures.v1`` — токен персонажа
+    Скоуп: ``esi-corporations.read_structures.v1`` — токен персонажа
     провайдера. Возвращает ``(структуры, partial)``: ``partial=True`` при нехватке
     лимита ошибок ESI. Элементы — dict/модель ESI с полями structure_id, name,
     solar_system_id, type_id и т.п.

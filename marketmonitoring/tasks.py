@@ -12,6 +12,7 @@ from typing import Any
 from celery import shared_task
 from django.core.cache import cache
 from django.db import transaction
+from django.db.models import Count
 from django.utils import timezone
 
 from .constants import (
@@ -27,7 +28,7 @@ from .constants import (
     TriggerKind,
 )
 from .esi import client as esi_client
-from .esi.selectors import get_calc_type_ids, get_sync_region_ids
+from .esi.selectors import get_calc_type_ids, get_sync_region_ids, is_jita_enabled
 from .models import (
     ContractCache,
     ContractItemCache,
@@ -210,16 +211,17 @@ def _replace_source_cache(source_kind: str, source_ref: int, rows: list[dict]) -
 
 
 def _mark_region_stations(region_id: int, status: str) -> int:
-    """Обновление sync_status NPC-станций региона после регионального синка (§8).
+    """Обновление sync_status локаций региона после регионального синка (§8).
 
     NPC-станции получают данные из регионального кэша заказов, поэтому их
     sync_status/last_synced_at отражают результат синка региона: успех — ok,
-    сбой/частичность — error. Один запрос .update() — без N+1. Структуры
-    и локации-системы не затрагиваются (структуры синкаются структурным
-    синком, системы не имеют своих рыночных данных).
+    сбой/частичность — error. Локации-системы используют те же региональные
+    данные для NPC-станций системы (§6.12), поэтому их статус обновляется
+    вместе со станциями. Один запрос .update() — без N+1. Структуры не
+    затрагиваются: их синкает отдельная задача sync_structure_orders.
     """
     now = timezone.now()
-    qs = MarketLocation.objects.filter(kind=LocationKind.STATION, region_id=region_id)
+    qs = MarketLocation.objects.filter(kind__in=(LocationKind.STATION, LocationKind.SYSTEM), region_id=region_id)
     if status == SyncStatus.OK:
         return qs.update(sync_status=SyncStatus.OK, last_synced_at=now)
     return qs.update(sync_status=status)
@@ -266,6 +268,8 @@ def _recalc_stock_levels_for_locations(location_ids: list[int]) -> int:
     """Пересчёт StockLevel полной заменой по затронутым локациям (§12.5).
 
     Агрегация MarketOrderCache → total_sell_volume / best_sell по (location_id, type_id).
+    ``solar_system_id``/``region_id`` берутся из строк кэша: для структур они
+    записаны из MarketLocation, а не из ответа ESI (§9.3).
     """
     from django.db.models import Min, Sum
 
@@ -361,8 +365,31 @@ def sync_jita_book(self, trigger: str = TriggerKind.BEAT, lock_token: str | None
     """Снимок стакана Jita по типам расчёта (§12.1); guard-интервал jita_sync_interval_min.
 
     Записывает MarketOrderCache по источнику (region, jita_region_id) и JitaOrderLevel.
+    Если локация Jita выключена/удалена из Locations — ESI не вызывается,
+    старый стакан и кэш региона удаляются, цепочка пересчёта не запускается
+    (явное указание заказчика; расхождение с §9.4 и №3/8/25/39 фиксируется в docs).
     """
     settings_obj = PluginSetting.load()
+    if not is_jita_enabled():
+        # До _start_run и до любого ESI: отключённая Jita не должна синкаться
+        # ни ручным запуском, ни beat. Чистка в одной транзакции (§12.5);
+        # .exists() не делает пустые DELETE при каждом beat-прогоне.
+        levels_qs = JitaOrderLevel.objects.all()
+        cache_qs = MarketOrderCache.objects.filter(
+            source_kind=SourceKind.REGION, source_ref=settings_obj.jita_region_id
+        )
+        levels_deleted = cache_deleted = 0
+        with transaction.atomic():
+            if levels_qs.exists():
+                levels_deleted = levels_qs.delete()[0] or 0
+            if cache_qs.exists():
+                cache_deleted = cache_qs.delete()[0] or 0
+        logger.info(
+            "Jita sync skipped: location disabled; deleted %s levels and %s order rows",
+            levels_deleted,
+            cache_deleted,
+        )
+        return {"skipped": True, "reason": "jita_disabled"}
     last = (
         SyncRun.objects.filter(task_name="marketmonitoring.sync_jita_book", trigger=TriggerKind.BEAT)
         .order_by("-started_at")
@@ -409,6 +436,20 @@ def sync_region_orders(
         .first()
     )
     region_ids = [region_id] if region_id else sorted(get_sync_region_ids())
+    # Один DEBUG-лог на задачу: почему выбранных регионов 0/несколько (§9.4),
+    # и какие типы включённых локаций есть в конфигурации. Один запрос, без N+1.
+    enabled_location_kinds = dict(
+        MarketLocation.objects.filter(enabled=True)
+        .values("kind")
+        .annotate(count=Count("pk"))
+        .values_list("kind", "count")
+    )
+    logger.debug(
+        "sync_region_orders: region_ids=%s, enabled MarketLocation total=%s by_kind=%s",
+        region_ids,
+        sum(enabled_location_kinds.values()),
+        enabled_location_kinds,
+    )
     if trigger == TriggerKind.BEAT and not _interval_expired(last, settings_obj.stock_sync_interval_min):
         return {"skipped": True}
     run = _start_run("marketmonitoring.sync_region_orders", trigger)
@@ -420,11 +461,13 @@ def sync_region_orders(
             try:
                 orders, partial = esi_client.fetch_region_orders(rid)
                 partial_any = partial_any or partial
-                rows = esi_client.build_order_cache_rows(orders, source_kind=SourceKind.REGION, source_ref=rid)
+                rows = esi_client.build_order_cache_rows(
+                    orders, source_kind=SourceKind.REGION, source_ref=rid, region_id=rid
+                )
                 items += _replace_source_cache(SourceKind.REGION, rid, rows)
-                # NPC-станции региона получают данные из регионального кэша:
-                # успех региона — их sync_status=ok и свежий last_synced_at
-                # (иначе чип навсегда остаётся stale, §8 MarketLocation.sync_status).
+                # NPC-станции и локации-системы региона получают данные из
+                # регионального кэша: успех — sync_status=ok и свежий
+                # last_synced_at (иначе чип навсегда остаётся stale, §8).
                 _mark_region_stations(rid, SyncStatus.OK if not partial else SyncStatus.ERROR)
                 ok += 1
             except Exception as exc:  # noqa: BLE001 — сбой одного региона не прерывает задачу (§9.5)
@@ -496,37 +539,41 @@ def sync_structure_orders(self, trigger: str = TriggerKind.BEAT, lock_token: str
                 provider = provider_service.switch_to_next_provider(structure_id, failed_character_ids)
                 if provider is None:
                     break
+                # CCP character_id из EveCharacter; provider.character_id — локальный FK PK (§8, §11).
+                character_id = provider.character.character_id
                 try:
-                    orders, partial = esi_client.fetch_structure_orders(structure_id, provider.character_id)
+                    orders, partial = esi_client.fetch_structure_orders(structure_id, character_id)
                 except HTTPClientError as exc:
                     status_code = getattr(exc, "status_code", None)
                     if status_code in (401, 403):
                         # ACL-сбой: счётчик, cooldown, при пороге — disabled + алерт (§11).
                         provider_service.handle_acl_failure(provider)
-                        failed_character_ids.add(provider.character_id)
-                        errors.append(f"structure {structure_id}: provider {provider.character_id} ACL {status_code}")
+                        failed_character_ids.add(character_id)
+                        errors.append(f"structure {structure_id}: provider {character_id} ACL {status_code}")
                         continue
                     # Не-ACL HTTP-ошибка (404 при удалённой структуре, 502 и т.п.):
                     # сбой этой структуры не прерывает задачу (§9.5).
                     failed += 1
                     http_failed = True
-                    errors.append(
-                        f"structure {structure_id}: provider {provider.character_id} HTTP {status_code}: {exc}"
-                    )
-                    logger.warning(
-                        "Structure %s sync via provider %s failed: %s", structure_id, provider.character_id, exc
-                    )
+                    errors.append(f"structure {structure_id}: provider {character_id} HTTP {status_code}: {exc}")
+                    logger.warning("Structure %s sync via provider %s failed: %s", structure_id, character_id, exc)
                     break
                 except ValueError as exc:
                     # Нет валидного токена AA у провайдера — не ACL, но провайдер не годится.
-                    logger.warning("Provider %s has no valid token: %s", provider.character_id, exc)
-                    failed_character_ids.add(provider.character_id)
+                    logger.warning("Provider %s has no valid token: %s", character_id, exc)
+                    failed_character_ids.add(character_id)
                     continue
                 # Успех (200): сброс acl_fail_count, status=ok (§11.4).
                 provider_service.handle_provider_success(provider)
                 partial_any = partial_any or partial
+                # ESI structural orders не содержат system/region — берём их из
+                # MarketLocation; source_ref — это structure_id, не region_id (§9.3).
                 rows = esi_client.build_order_cache_rows(
-                    orders, source_kind=SourceKind.STRUCTURE, source_ref=structure_id
+                    orders,
+                    source_kind=SourceKind.STRUCTURE,
+                    source_ref=structure_id,
+                    solar_system_id=location.solar_system_id,
+                    region_id=location.region_id,
                 )
                 items += _replace_source_cache(SourceKind.STRUCTURE, structure_id, rows)
                 _update_structure_name(location, provider)
@@ -568,13 +615,14 @@ def _update_structure_name(location: MarketLocation, provider) -> None:
 
     Временное имя — плейсхолдер «Structure <id>»; после успешного синка
     подтягивается настоящее имя структуры. Сбой обновления имени не влияет
-    на результат синка.
+    на результат синка. Токен ESI ищется по CCP ID персонажа
+    (``provider.character.character_id``), а не по PK FK.
     """
     placeholder = f"Structure {location.structure_id}"
     if location.name != placeholder:
         return
     try:
-        info = esi_client.fetch_structure_info(location.structure_id, provider.character_id)
+        info = esi_client.fetch_structure_info(location.structure_id, provider.character.character_id)
     except Exception as exc:  # noqa: BLE001 — имя не критично для расчётов
         logger.info("Could not fetch structure info for %s: %s", location.structure_id, exc)
         return
@@ -814,7 +862,7 @@ def sync_corp_structures(self, trigger: str = TriggerKind.BEAT) -> dict:
 
     Для каждого включённого ``ContractProvider`` (corporation) тянет список
     структур его корпорации (``GET /corporations/{id}/structures/``, скоуп
-    ``esi-corporations.read_corporation_structures.v1``) и регистрирует
+    ``esi-corporations.read_structures.v1``) и регистрирует
     незнакомые структуры в ``MarketLocation(kind=structure, enabled=False)``
     — включаются вручную в Locations UI (решение №37). Существующие записи
     не трогаются, кроме заполнения пустого ``solar_system_id``/``region_id``
@@ -960,16 +1008,24 @@ def recalc_stock_levels(
     только по локациям, у которых есть строки MarketOrderCache. В конце — пересчёт фитов/компонентов (§6, calc-ядро).
     lock_token: финальная задача цепочки ручного запуска снимает mm:sync_lock,
     если её значение совпадает с токеном (§12.4); при beat блокировка не трогается.
+
+    Ручное обновление ставит несколько sync-задач параллельно, и каждая из них
+    запускает сюда пересчёт. Блокировка строки singleton-настроек сериализует
+    пересчёты: два concurrent-прогона с разными снимками locations не могут
+    стереть StockLevel локаций, появившихся в кэше между снимками (§12.5).
     """
     run = _start_run("marketmonitoring.recalc_stock_levels", trigger)
     try:
-        if location_ids is None:
-            location_ids = list(MarketOrderCache.objects.values_list("location_id", flat=True).distinct())
-        count = _recalc_stock_levels_for_locations(list(location_ids))
         # Пересчёт фитов/компонентов (§12.1) — calc-ядро этапа 4.
         from .calc import service as calc_service
 
-        calc_stats = calc_service.recalc_all()
+        with transaction.atomic():
+            PluginSetting.objects.get_or_create(pk=1)
+            PluginSetting.objects.select_for_update().get(pk=1)
+            if location_ids is None:
+                location_ids = list(MarketOrderCache.objects.values_list("location_id", flat=True).distinct())
+            count = _recalc_stock_levels_for_locations(list(location_ids))
+            calc_stats = calc_service.recalc_all()
         _finish_run(run, status=SyncRunStatus.OK, items_processed=count)
         _release_sync_lock(trigger, lock_token)
         return {"ok": True, "levels": count, **calc_stats}
@@ -982,7 +1038,11 @@ def recalc_stock_levels(
 
 @shared_task(bind=True, name="marketmonitoring.cleanup_orphan_cache")
 def cleanup_orphan_cache(self, trigger: str = TriggerKind.BEAT) -> dict:
-    """Удаление кэша отключённых/удалённых локаций (§12.1); интервал 24 ч (§12.2)."""
+    """Удаление кэша отключённых/удалённых локаций (§12.1); интервал 24 ч (§12.2).
+
+    Дополнительно: если Jita выключена/удалена, явно удаляются JitaOrderLevel
+    и кэш заказов (region, jita_region_id) — без stale-цен в UI (указание заказчика).
+    """
     run = _start_run("marketmonitoring.cleanup_orphan_cache", trigger)
     try:
         # Guard 24 ч: только строки кэша, не обновлённые за интервал, у неактивных источников.
@@ -997,8 +1057,20 @@ def cleanup_orphan_cache(self, trigger: str = TriggerKind.BEAT) -> dict:
         )
         # Регионы, которые ещё нужны (§9.4): регионы включённых локаций и синка — их кэш не удаляем.
         needed_regions = set(get_sync_region_ids())
+        settings_obj = PluginSetting.load()
         total = 0
         with transaction.atomic():
+            if not is_jita_enabled():
+                # Jita удалена/отключена: get_sync_region_ids уже исключает её регион,
+                # но стакан не привязан к региону — удаляем явно, чтобы не осталось
+                # stale-цен. Кэш (region, jita_region_id) чистим без ожидания 24 ч.
+                total += JitaOrderLevel.objects.all().delete()[0] or 0
+                total += (
+                    MarketOrderCache.objects.filter(
+                        source_kind=SourceKind.REGION, source_ref=settings_obj.jita_region_id
+                    ).delete()[0]
+                    or 0
+                )
             for kind, valid_refs in (
                 (SourceKind.REGION, needed_regions),
                 (SourceKind.STRUCTURE, enabled_structures),
@@ -1076,7 +1148,11 @@ def verify_providers(self, trigger: str = TriggerKind.BEAT) -> dict:
         return {"skipped": True}
     run = _start_run("marketmonitoring.verify_providers", trigger)
     try:
-        providers = list(StructureProvider.objects.filter(enabled=True).order_by("priority", "character_id"))
+        providers = list(
+            StructureProvider.objects.select_related("character")
+            .filter(enabled=True)
+            .order_by("priority", "character__character_id", "pk")
+        )
         structure_ids = list(
             MarketLocation.objects.filter(enabled=True, kind=LocationKind.STRUCTURE, structure_id__isnull=False)
             .order_by("pk")
@@ -1087,27 +1163,29 @@ def verify_providers(self, trigger: str = TriggerKind.BEAT) -> dict:
         errors: list[str] = []
         for provider in providers:
             verified = False
+            # CCP character_id, а не локальный PK FK (provider.character_id).
+            character_id = provider.character.character_id
             for structure_id in structure_ids:
                 try:
-                    esi_client.fetch_structure_info(structure_id, provider.character_id)
+                    esi_client.fetch_structure_info(structure_id, character_id)
                 except HTTPClientError as exc:
                     status_code = getattr(exc, "status_code", None)
                     if status_code in (401, 403):
                         # Фактический ACL-сбой — обработка §11 (счётчик/cooldown).
                         provider_service.handle_acl_failure(provider)
-                        errors.append(f"provider {provider.character_id} structure {structure_id}: ACL {status_code}")
+                        errors.append(f"provider {character_id} structure {structure_id}: ACL {status_code}")
                         break
                     if status_code == 404:
                         # Структура недоступна/не существует — без изменения счётчика (§11).
                         # Провайдер при этом верифицирован: сбой относится к структуре,
                         # а не к доступу провайдера.
-                        logger.warning("Structure %s not found for provider %s", structure_id, provider.character_id)
+                        logger.warning("Structure %s not found for provider %s", structure_id, character_id)
                         verified = True
                         continue
                     raise
                 except ValueError as exc:
                     # Нет валидного токена у провайдера — без изменения счётчика.
-                    logger.info("Provider %s has no valid token: %s", provider.character_id, exc)
+                    logger.info("Provider %s has no valid token: %s", character_id, exc)
                     break
                 verified = True
             # Если включённых структур нет — проверять нечего, провайдер считается верифицированным.
@@ -1221,14 +1299,19 @@ def notify_deficit(self, trigger: str = TriggerKind.BEAT) -> dict:
                     for component in result.components
                     if component.deficit > 0
                 }
-                rounded_total = (result.total_cost or Decimal("0")).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+                # Отключённая Jita: цены нет — в хэш пишем "n/a", не "0 ISK".
+                total_for_hash = (
+                    "n/a"
+                    if result.total_cost is None
+                    else str(result.total_cost.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+                )
                 # Хэш состояния deficit (§13.1): fit_id || K || {t: D>0} || rounded Total.
                 state_hash = discord.canonical_state_hash(
                     {
                         "fit_id": fit.pk,
                         "k": result.k,
                         "deficits": deficit_map,
-                        "total": str(rounded_total),
+                        "total": total_for_hash,
                     }
                 )
                 deficit_due = _deficit_notification_due(

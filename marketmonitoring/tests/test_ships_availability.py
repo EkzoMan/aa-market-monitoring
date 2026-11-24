@@ -493,8 +493,8 @@ def test_market_no_data_excluded_from_summary_and_shown_as_dash(viewer_client, s
     """NO_DATA в рыночной части: контракты известны, но C+K и стоимость не считаются."""
     fit = _seed_reference_market(sde_ids, name="No market data")
     _seed_full_kit_contracts(fit, 7)
-    # Нет агрегата StockLevel по зарядам — рыночная часть NO_DATA (§6.7).
-    StockLevel.objects.filter(type_id=3).delete()
+    # Нет агрегатов StockLevel по локации — рыночная часть NO_DATA (§6.7).
+    StockLevel.objects.all().delete()
 
     result = calc_service.recalc_fit(fit)
     fit.refresh_from_db()
@@ -526,6 +526,52 @@ def test_market_no_data_excluded_from_summary_and_shown_as_dash(viewer_client, s
     assert detail_response.context["ships_total"] is None
     assert detail_response.context["ships_deficit"] is None
     assert "&mdash;" in detail_response.content.decode("utf-8")
+
+
+def test_disabled_jita_does_not_show_stale_prices(viewer_client, sde_ids):  # noqa: F811
+    """Выключенная Jita: цены докупки недоступны, но K/D_i/статус считаются по локальным рынкам.
+
+    Уточнённый контракт: unit/ref/cost/shortfall/overprice_pct = None,
+    Fit.total_cost = None, overprice_count = 0; полный NO_DATA из-за Jita
+    не наступает (§6.7 — только про свежесть рыночных локаций).
+    """
+    fit = _seed_reference_market(sde_ids)
+    baseline = calc_service.recalc_fit(fit)
+    assert baseline.total_cost == D("1269912500")
+
+    # Локацию выключаем, строки JitaOrderLevel намеренно оставляем в БД.
+    MarketLocation.objects.filter(station_id=STATION_ID).update(enabled=False)
+    settings_obj = PluginSetting.load()
+    assert calc_service.get_jita_book(1, settings_obj.jita_book_depth) == ([], None)
+
+    result = calc_service.recalc_fit(fit)
+    fit.refresh_from_db()
+    assert result.status == FitStatus.DEFICIT
+    assert result.k == 10
+    assert [c.deficit for c in result.components] == [20, 0, 20000]
+    assert fit.status_cache == FitStatus.DEFICIT
+    assert result.total_cost is None and fit.total_cost is None
+    assert result.overprice_count == 0
+    for component in result.components:
+        assert component.unit is None
+        assert component.ref is None
+        assert component.cost is None
+        assert component.shortfall is None
+        assert component.is_not_covered is False
+        assert component.is_overprice is False
+        assert component.overprice_pct is None
+
+    with _no_esi():
+        detail_response = viewer_client.get(reverse("marketmonitoring:fit_detail", args=[fit.pk]))
+    assert detail_response.status_code == 200
+    context = detail_response.context
+    assert context["total_cost"] is None
+    assert "&mdash;" in detail_response.content.decode("utf-8")
+    rows = {row["component"].type_id: row for row in context["rows"]}
+    for type_id in (1, 3):
+        assert rows[type_id]["ref"] is None
+        assert rows[type_id]["unit"] is None
+        assert rows[type_id]["cost"] is None
 
 
 def test_dashboard_sum_counts_per_fit_k_not_unique_modules(viewer_client, sde_ids):  # noqa: F811
@@ -603,7 +649,8 @@ def test_ui_shows_ships_columns_and_edit_only_refresh(viewer_client, editor_clie
     index_html = viewer_index.content.decode("utf-8")
     assert "Ships on contracts" in index_html
     assert "Ships from market (K/N, per fit)" in index_html
-    assert "Ships total (C+K)" in index_html
+    assert "Collectability (C+K)" in index_html
+    assert "Ships total (C+K)" not in index_html  # дубль удалён
     assert "DEFICIT" in index_html
     assert 'id="mm-refresh-btn"' not in index_html
     assert 'id="mm-refresh-btn"' in editor_index.content.decode("utf-8")
@@ -652,6 +699,18 @@ def test_ships_deficit_hash_is_separate_and_old_hashes_are_stable(sde_ids):  # n
 
 def test_beat_schedule_has_market_syncs_with_five_minute_tick_and_guards(sde_ids):  # noqa: F811
     """Рыночные sync_* и notify_deficit в beat каждые 5 мин; guard блокирует частые запуски."""
+    # sync_jita_book guard проверяется на включённой локации — иначе задача
+    # пропускается по jita_disabled раньше проверки интервала.
+    MarketLocation.objects.create(
+        name="Jita IV-4",
+        kind=LocationKind.STATION,
+        station_id=STATION_ID,
+        solar_system_id=SYSTEM_ID,
+        region_id=REGION_ID,
+        enabled=True,
+        sync_status=SyncStatus.OK,
+        last_synced_at=timezone.now(),
+    )
     schedule = tasks.build_beat_schedule()
     expected_tasks = (
         "marketmonitoring.sync_jita_book",

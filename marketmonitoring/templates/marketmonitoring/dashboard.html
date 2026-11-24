@@ -154,15 +154,14 @@
       <thead>
         <tr>
           <th>{% translate "Fit" %}</th>
+          {# Collectability = C+K (§6.13, решение №40): единая колонка итога; дубль «Ships total (C+K)» удалён. #}
+          <th>{% translate "Collectability (C+K)" %}</th>
+          <th>{% translate "Ships status" %}</th>
           <th>{% translate "Ships on contracts" %}</th>
           <th>{% translate "Ships from market (K/N, per fit)" %}</th>
-          <th>{% translate "Contracts status" %}</th>
-          <th>{% translate "Collectability" %}</th>
-          <th class="text-end">{% translate "Ships total (C+K)" %}</th>
-          <th>{% translate "Ships status" %}</th>
+          <th>{% translate "Contracts status" %}</th>          
           <th>{% translate "Status" %}</th>
-          <th class="text-end">{% translate "Total to buy" %}</th>
-          <th class="text-end">{% translate "Overprice" %}</th>
+          {# Столбцы «Total to buy» и «Overprice» удалены из таблицы по требованию пользователя. #}
           <th>{% translate "Bottleneck" %}</th>
           <th>{% translate "Last check" %}</th>
         </tr>
@@ -171,6 +170,20 @@
         {% for row in rows %}
         <tr>
           <td class="mm-nowrap"><a href="{% url 'marketmonitoring:fit_detail' row.fit.pk %}">{{ row.fit.name }}</a></td>
+          {# Collectability = C+K: число и прогресс из сводки кораблей, а не из рыночного K. При no_data — «—» без прогресса (решение №43). #}
+          <td>
+            {% if row.ships_total is not None %}
+            <span class="mm-num fw-semibold">{{ row.ships_total }} <span class="text-body-secondary">{% translate "of" %} {{ row.fit.qty_target }}</span></span>
+            <div class="progress mm-progress mt-1">
+              <div class="progress-bar bg-{{ row.ships_status|status_class }}"
+                   style="width: {% widthratio row.ships_total row.fit.qty_target 100 %}%"></div>
+            </div>
+            {% else %}
+            &mdash;
+            {% endif %}
+          </td>
+          <td><span class="badge text-bg-{{ row.ships_status|status_class }}">{{ row.ships_status|upper }}</span></td>
+          <td><span class="badge text-bg-{{ row.fit.status_cache|status_class }}">{{ row.fit.get_status_cache_display }}</span></td>
           <td>
             {% if row.fit.contracts_status_cache == 'ok' or row.fit.contracts_status_cache == 'deficit' %}
             <span class="mm-num fw-semibold">{{ row.fit.contracts_available }} <span class="text-body-secondary">{% translate "of" %} {{ row.fit.qty_target }}</span></span>
@@ -192,26 +205,6 @@
             {% else %}&mdash;{% endif %}
           </td>
           <td><span class="badge text-bg-{{ row.fit.contracts_status_cache|status_class }}">{{ row.fit.get_contracts_status_cache_display }}</span></td>
-          <td>
-            {% if row.fit.status_cache == 'ok' or row.fit.status_cache == 'deficit' %}
-            <span class="mm-num fw-semibold">{{ row.fit.fits_available }} <span class="text-body-secondary">{% translate "of" %} {{ row.fit.qty_target }}</span></span>
-            <div class="progress mm-progress mt-1">
-              <div class="progress-bar bg-{{ row.fit.status_cache|status_class }}"
-                   style="width: {% widthratio row.fit.fits_available row.fit.qty_target 100 %}%"></div>
-            </div>
-            {% else %}
-            &mdash;
-            {% endif %}
-          </td>
-          <td class="mm-num">
-            {% if row.ships_total is not None %}
-            <span class="mm-num fw-semibold">{{ row.ships_total }} <span class="text-body-secondary">{% translate "of" %} {{ row.fit.qty_target }}</span></span>
-            {% else %}&mdash;{% endif %}
-          </td>
-          <td><span class="badge text-bg-{{ row.ships_status|status_class }}">{{ row.ships_status|upper }}</span></td>
-          <td><span class="badge text-bg-{{ row.fit.status_cache|status_class }}">{{ row.fit.get_status_cache_display }}</span></td>
-          <td class="mm-num">{% if row.fit.status_cache == 'no_data' or row.fit.status_cache == 'hull_missing' %}&mdash;{% else %}{{ row.fit.total_cost|isk }} <span class="text-body-secondary">ISK</span>{% endif %}</td>
-          <td class="mm-num">{% if row.fit.overprice_count %}<span class="badge text-bg-warning">{{ row.fit.overprice_count }}</span>{% else %}&mdash;{% endif %}</td>
           <td>{% bottleneck_line row.bottleneck_names row.bottleneck_extra %}</td>
           <td class="mm-nowrap">{{ row.fit.last_checked_at|date:"Y-m-d H:i" }}</td>
         </tr>

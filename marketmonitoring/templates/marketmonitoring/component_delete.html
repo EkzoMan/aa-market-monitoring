@@ -1,0 +1,26 @@
+{% extends "allianceauth/base-bs5.html" %}
+{% load i18n static mm_tags %}
+{% block title %}{{ page_title }}{% endblock %}
+
+{% block page_title %}{{ page_title }}{% endblock %}
+
+{% block content %}
+<link rel="stylesheet" href="{% static 'marketmonitoring/css/mm.css' %}">
+{# Confirm-экран удаления компонента (04-components.md, 07-states.md §5). #}
+<div class="card border-danger">
+  <div class="card-header bg-danger-subtle">
+    <h3 class="card-title">
+      <i class="fas fa-triangle-exclamation text-danger me-1" aria-hidden="true"></i>
+      {% translate "Delete component" %} “{{ type_name }}”?
+    </h3>
+  </div>
+  <div class="card-body">
+    <p>{% translate "Component will be removed from this scope; fits are not affected." %}</p>
+    <form method="post">
+      {% csrf_token %}
+      <a href="{% url 'marketmonitoring:components' %}" class="btn btn-outline-secondary">{% translate "Cancel" %}</a>
+      <button type="submit" class="btn btn-danger"><i class="fas fa-trash me-1" aria-hidden="true"></i>{% translate "Delete — cannot be undone" %}</button>
+    </form>
+  </div>
+</div>
+{% endblock %}

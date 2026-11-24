@@ -239,7 +239,7 @@ def test_fit_detail_overprice_tooltip_pct(editor_client, eve_types, sde_ids):  #
     from django.utils import timezone
 
     from ..models import JitaOrderLevel
-    from .test_views_ui import _add_stock
+    from .test_views_ui import _add_stock, _enable_jita_location
 
     fit = Fit.objects.create(
         name="Overprice pct fit",
@@ -251,6 +251,7 @@ def test_fit_detail_overprice_tooltip_pct(editor_client, eve_types, sde_ids):  #
     )
     fit.components.create(type_id=643, qty_per_fit=1)
     fit.components.create(type_id=2046, qty_per_fit=1)
+    _enable_jita_location()  # без включённой локации стакан не читается
     _add_stock(60003760, 643, 3)
     _add_stock(60003761, 643, 3)
     _add_stock(60003760, 2046, 1)

@@ -173,6 +173,9 @@ cython_debug/
 # Ruff stuff:
 .ruff_cache/
 
+# Windows alternate data stream artifacts (Zone.Identifier):
+*Zone.Identifier
+
 # PyPI configuration file
 .pypirc
 
