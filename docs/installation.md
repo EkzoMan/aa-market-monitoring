@@ -69,7 +69,7 @@ ESI_SSO_CALLBACK_URL = "https://<ваш-auth>/sso/callback"
 
 ### 5. Celery / beat
 
-Beat дёргает задачи синка (`sync_jita_book`, `sync_region_orders`, `sync_structure_orders`, `verify_providers`) **каждые 5 минут**, `cleanup_orphan_cache` — ежедневно. Каждая задача сама проверяет, истёк ли её интервал (`jita_sync_interval_min`, `stock_sync_interval_min` — из настроек плагина), поэтому интервалы меняются в UI без правки beat-расписания. Частый beat — намеренное решение ТЗ (§10): расписание остаётся фиксированным, а логика частоты живёт в настройках.
+Beat дёргает `sync_jita_book`, `sync_region_orders`, `sync_structure_orders`, `sync_contracts`, `verify_providers` и `notify_deficit` **каждые 5 минут**; `cleanup_orphan_cache` и `sync_corp_structures` — ежедневно. Каждая задача сама проверяет, истёк ли её интервал (`jita_sync_interval_min`, `stock_sync_interval_min`, `contracts_sync_interval_min` — из настроек плагина; 60 мин для `verify_providers`, 24 ч для ежедневных задач), поэтому интервалы меняются в UI без правки beat-расписания. Частый beat — намеренное решение ТЗ (§12.2): расписание остаётся фиксированным, а логика частоты живёт в настройках. Готовое расписание даёт фабрика `marketmonitoring.tasks.build_beat_schedule()` (см. [README.md](../README.md)).
 
 Пример beat-расписания (обычно задаётся в `beat_schedule` проекта AA):
 
@@ -87,10 +87,13 @@ CELERYBEAT_SCHEDULE["marketmonitoring_sync"] = {
 - `marketmonitoring.sync_jita_book`
 - `marketmonitoring.sync_region_orders`
 - `marketmonitoring.sync_structure_orders`
+- `marketmonitoring.sync_contracts`
 - `marketmonitoring.verify_providers`
+- `marketmonitoring.notify_deficit` — вызывается beat-тиком каждые 5 минут, но отправляет уведомления только при `trigger=beat`
 - `marketmonitoring.cleanup_orphan_cache` — ежедневно (интервал 24 ч внутри задачи)
+- `marketmonitoring.sync_corp_structures` — ежедневно (решение №37 §20, guard 24 ч внутри задачи)
 
-Цепочка: `sync_*` → `recalc_stock_levels` → `notify_deficit` (последняя — только при trigger=beat) запускается задачами синка автоматически, отдельно в beat её включать не нужно.
+Цепочка: `sync_*` → `recalc_stock_levels` → `notify_deficit`. Уведомления о дефиците (`deficit`, `contracts_deficit`, `ships_deficit`) отправляются только при `trigger=beat`; ручной запуск их не порождает (§12.4, этап 9 §21). Фабрика `build_beat_schedule()` уже включает `notify_deficit` наравне с задачами синка: при её использовании отдельная запись не требуется, а при собственном `CELERYBEAT_SCHEDULE` задачу нужно прописать явно (см. [README.md](../README.md)).
 
 ### 6. Проверка установки
 

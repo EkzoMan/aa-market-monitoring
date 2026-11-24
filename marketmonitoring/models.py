@@ -13,6 +13,7 @@ from .constants import (
     LocationKind,
     ProviderStatus,
     ScopeKind,
+    ShipsStatus,
     SourceKind,
     SyncRunStatus,
     SyncStatus,
@@ -98,6 +99,9 @@ class Fit(models.Model):
         max_length=16, choices=ContractFitStatus.choices, default=ContractFitStatus.NO_DATA, db_index=True
     )
     contracts_available = models.IntegerField(null=True, blank=True)  # C — комплектов кораблей в контрактах (§6.12)
+    ships_status_cache = models.CharField(
+        max_length=16, choices=ShipsStatus.choices, default=ShipsStatus.NO_DATA  # общий статус C+K (§6.13)
+    )
 
     class Meta:
         verbose_name = _("Fit")

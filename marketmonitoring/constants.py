@@ -51,6 +51,14 @@ class ContractFitStatus(models.TextChoices):
     NO_DATA = "no_data", _("NO_DATA")
 
 
+class ShipsStatus(models.TextChoices):
+    """Общий статус доступных кораблей C+K (§8 Fit.ships_status_cache, §6.13)."""
+
+    OK = "ok", _("OK")
+    DEFICIT = "deficit", _("DEFICIT")
+    NO_DATA = "no_data", _("NO_DATA")
+
+
 class ContractSourceKind(models.TextChoices):
     """Вид источника контрактов ESI (§8 ContractProvider.source_kind, ContractCache.source_kind)."""
 
@@ -94,6 +102,7 @@ class NotificationEvent(models.TextChoices):
 
     DEFICIT = "deficit", _("deficit")
     CONTRACTS_DEFICIT = "contracts_deficit", _("contracts_deficit")
+    SHIPS_DEFICIT = "ships_deficit", _("ships_deficit")
     HULL_MISSING = "hull_missing", _("hull_missing")
     PROVIDER_ACL_LOST = "provider_acl_lost", _("provider_acl_lost")
     SYNC_FAILED = "sync_failed", _("sync_failed")

@@ -17,7 +17,7 @@ from django.utils.translation import gettext as _
 from ..auth_hooks import has_edit, has_view
 from ..calc import engine
 from ..calc.engine import ComponentInput
-from ..calc.service import resolve_scope_ids
+from ..calc.service import get_ships_availability, resolve_scope_ids
 from ..constants import ContractFitStatus, FitStatus, ScopeKind
 from ..models import Fit, FitComponent, StockLevel, SyncRun
 from ..tasks import SYNC_LOCK_KEY
@@ -163,14 +163,25 @@ def index(request):
 
     # Фильтр по узкому месту применяется после расчёта (§14).
     bottleneck_type_id = int(bottleneck_filter) if bottleneck_filter.isdigit() else None
+    # Сводка C+K (§6.13): только примитивы из кэша фитов, без запросов ESI и без N+1.
+    ships_by_fit = {fit.pk: get_ships_availability(fit) for fit in fits}
     rows = []
     for fit in fits:
         bottleneck_type_ids = bottlenecks_by_fit.get(fit.pk, [])
         if bottleneck_type_id is not None and bottleneck_type_id not in bottleneck_type_ids:
             continue
         names = [str(type_names.get(type_id, f"type {type_id}")) for type_id in bottleneck_type_ids]
+        ships = ships_by_fit[fit.pk]
         rows.append(
-            {"fit": fit, "bottleneck_names": names, "bottleneck_extra": max(0, len(names) - BOTTLENECK_DISPLAY_LIMIT)}
+            {
+                "fit": fit,
+                "bottleneck_names": names,
+                "bottleneck_extra": max(0, len(names) - BOTTLENECK_DISPLAY_LIMIT),
+                "ships_in_contracts": ships.ships_in_contracts,
+                "ships_from_market": ships.ships_from_market,
+                "ships_total": ships.ships_total,
+                "ships_status": ships.ships_status,
+            }
         )
 
     # Сводная панель (§14): контракты в первую очередь; стоимость из блока
@@ -184,6 +195,11 @@ def index(request):
     contracts_no_data_count = sum(1 for fit in fits if fit.contracts_status_cache == ContractFitStatus.NO_DATA)
     no_data_count = sum(1 for fit in fits if fit.status_cache == FitStatus.NO_DATA)
     hull_missing_count = sum(1 for fit in fits if fit.status_cache == FitStatus.HULL_MISSING)
+    # ΣC / ΣK / Σ(C+K) только для фитов, где оба значения известны (решение №41).
+    known_ships = [ships for ships in ships_by_fit.values() if not ships.is_partial]
+    ships_in_contracts_sum = sum(ships.ships_in_contracts or 0 for ships in known_ships)
+    ships_from_market_sum = sum(ships.ships_from_market or 0 for ships in known_ships)
+    ships_total_sum = sum(ships.ships_total or 0 for ships in known_ships)
 
     scope_pairs = list(Fit.objects.values_list("scope_kind", "scope_ref").distinct())
     scope_labels = _scope_labels(scope_pairs)
@@ -214,6 +230,9 @@ def index(request):
         "contracts_deficit_fits_count": contracts_deficit_fits_count,
         "contracts_missing_ships_total": contracts_missing_ships_total,
         "contracts_no_data_count": contracts_no_data_count,
+        "ships_in_contracts_sum": ships_in_contracts_sum,
+        "ships_from_market_sum": ships_from_market_sum,
+        "ships_total_sum": ships_total_sum,
         "no_data_count": no_data_count,
         "hull_missing_count": hull_missing_count,
         "has_any_fits": Fit.objects.exists(),

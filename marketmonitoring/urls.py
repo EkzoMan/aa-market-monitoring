@@ -24,7 +24,6 @@ urlpatterns = [
     path("locations/systems.json", locations.system_search, name="system_search"),
     path("locations/stations.json", locations.station_search, name="station_search"),
     path("locations/regions.json", locations.region_search, name="region_search"),
-    path("locations/regions.json", locations.region_search, name="region_search"),
     path("locations/structures.json", locations.structure_search_start, name="structure_search_start"),
     path("locations/structures/result.json", locations.structure_search_result, name="structure_search_result"),
     path("settings/", settings_views.settings_view, name="settings"),

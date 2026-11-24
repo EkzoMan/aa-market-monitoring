@@ -76,6 +76,37 @@
   {% endif %}
 </div>
 
+{# Сводка C+K (§6.13): контракты + рынок, общий статус и агрегатный дефицит. #}
+<div class="card mb-3">
+  <div class="card-header d-flex flex-wrap align-items-center gap-2">
+    <h3 class="card-title mb-0 me-auto">{% translate "Available ships" %}</h3>
+    <span class="badge text-bg-{{ ships_status|status_class }}">{{ ships_status|upper }}</span>
+    {% if ships_deficit %}
+    <span class="badge text-bg-warning">{% blocktranslate count counter=ships_deficit %}Missing {{ counter }} ship{% plural %}Missing {{ counter }} ships{% endblocktranslate %}</span>
+    {% endif %}
+  </div>
+  <div class="card-body d-flex flex-wrap gap-4">
+    <span class="small">
+      <span class="mm-num fw-semibold">
+        {% if ships_in_contracts is not None %}{{ ships_in_contracts }}{% else %}&mdash;{% endif %}
+      </span>
+      <span class="text-body-secondary">{% translate "C (contracts)" %}</span>
+    </span>
+    <span class="small">
+      <span class="mm-num fw-semibold">
+        {% if ships_from_market is not None %}{{ ships_from_market }}{% else %}&mdash;{% endif %}
+      </span>
+      <span class="text-body-secondary">{% translate "K (market, per fit)" %}</span>
+    </span>
+    <span class="small">
+      <span class="mm-num fw-semibold">
+        {% if ships_total is not None %}{{ ships_total }}{% else %}&mdash;{% endif %}
+      </span>
+      <span class="text-body-secondary">{% translate "C+K (total)" %}</span>
+    </span>
+  </div>
+</div>
+
 <div class="card card-primary">
   <div class="card-header">
     <div class="d-flex flex-wrap align-items-center gap-3">

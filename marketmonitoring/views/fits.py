@@ -415,7 +415,7 @@ def fit_detail(request, fit_id: int):
     from django.apps import apps
 
     from ..calc import engine
-    from ..calc.service import evaluate_fit_contracts
+    from ..calc.service import evaluate_fit_contracts, get_ships_availability
     from ..constants import ScopeKind
     from ..models import FitComponent
     from ._calc_view import build_fit_component_rows
@@ -490,6 +490,15 @@ def fit_detail(request, fit_id: int):
 
     contract_rows = [{"contract": contract, "ships_count": ships_count} for contract, ships_count in matched_contracts]
 
+    # Сводная доступность C+K (§6.13): только примитивы из БД и чистые функции ядра.
+    ships = get_ships_availability(
+        fit,
+        contracts_available=contracts_res.ships_available,
+        market_available=None if no_data else k,
+        contracts_status=contracts_res.status,
+        market_status=status,
+    )
+
     context = {
         "page_title": fit.name,
         "fit": fit,
@@ -498,6 +507,11 @@ def fit_detail(request, fit_id: int):
         "contracts_deficit": contracts_res.deficit,
         "contracts_reasons": contracts_reasons,
         "contract_rows": contract_rows,
+        "ships_in_contracts": ships.ships_in_contracts,
+        "ships_from_market": ships.ships_from_market,
+        "ships_total": ships.ships_total,
+        "ships_deficit": ships.ships_deficit,
+        "ships_status": ships.ships_status,
         "status": status,
         "k": None if no_data else k,
         "total_cost": display_total,

@@ -37,9 +37,8 @@ SCOPE_CORP_CONTRACTS = "esi-contracts.read_corporation_contracts.v1"
 SCOPE_CHAR_CONTRACTS = "esi-contracts.read_character_contracts.v1"
 
 # Скоуп списка структур корпорации провайдера (решение №37 §20).
-SCOPE_CORP_STRUCTURES = "esi-corporations.read_corporation_structures.v1"
-
-# Скоуп списка структур корпорации провайдера (решение №37 §20).
+# Официальная спека ESI указывает другой scope; расхождение зафиксировано
+# отдельно без пересмотра решения №37.
 SCOPE_CORP_STRUCTURES = "esi-corporations.read_corporation_structures.v1"
 
 # Порог заголовка X-ESI-Error-Limit-Remain (§9.2).
@@ -337,7 +336,10 @@ def fetch_structure_orders(structure_id: int, character_id: int) -> tuple[list[d
     orders: list[dict] = []
     op = esi.client.Market.GetMarketsStructuresStructureId
     try:
-        for page_orders, _resp in _page_results(op, structure_id=structure_id, order_type="sell", token=token):
+        # Офиц. спека эндпоинта structures/orders не поддерживает order_type:
+        # sell-фильтр выполняется локально в build_order_cache_rows (§9.3),
+        # расхождение с таблицей §9.1 вынесено отдельно без пересмотра решений §20.
+        for page_orders, _resp in _page_results(op, structure_id=structure_id, token=token):
             orders.extend(page_orders)
         return orders, False
     except RateLimitStop:

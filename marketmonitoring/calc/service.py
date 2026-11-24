@@ -18,6 +18,7 @@ from ..constants import (
     FitStatus,
     LocationKind,
     ScopeKind,
+    ShipsStatus,
     SyncStatus,
 )
 from ..models import (
@@ -38,9 +39,13 @@ from .engine import (
     ContractItemInput,
     ContractsFitCalcResult,
     OrderBookRow,
+    ShipsAvailabilityResult,
 )
 
 logger = logging.getLogger("marketmonitoring")
+
+# Сентинел: отличает «аргумент не передан» от явного None при пересчёте фита.
+_UNSET = object()
 
 
 class FitCalcResult:
@@ -64,6 +69,7 @@ class FitCalcResult:
         contracts_available: int | None = None,
         contracts_deficit: int | None = None,
         contracts_reasons: list[str] | None = None,
+        ships_availability: ShipsAvailabilityResult | None = None,
     ):
         self.status = status
         self.k = k
@@ -75,6 +81,30 @@ class FitCalcResult:
         self.contracts_available = contracts_available
         self.contracts_deficit = contracts_deficit
         self.contracts_reasons = contracts_reasons or []
+        self.ships_availability = ships_availability
+
+
+def get_ships_availability(
+    fit: Fit,
+    *,
+    contracts_available: int | None | object = _UNSET,
+    market_available: int | None | object = _UNSET,
+    contracts_status: str | None | object = _UNSET,
+    market_status: str | None | object = _UNSET,
+) -> ShipsAvailabilityResult:
+    """Сводная доступность кораблей фита C+K (§6.13, решение №44).
+
+    По умолчанию читает уже сохранённый кэш ``Fit`` (только БД плагина, без ESI).
+    Необязательные аргументы позволяют передать ещё не сохранённые результаты
+    текущего пересчёта — движок получает только примитивы и строки статусов.
+    """
+    return engine.calc_ships_availability(
+        qty_target=fit.qty_target,
+        contracts_available=fit.contracts_available if contracts_available is _UNSET else contracts_available,
+        market_available=fit.fits_available if market_available is _UNSET else market_available,
+        contracts_status=fit.contracts_status_cache if contracts_status is _UNSET else contracts_status,
+        market_status=fit.status_cache if market_status is _UNSET else market_status,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -519,14 +549,16 @@ def _save_fit_cache(
     overprice_count: int | None,
     contracts_status: str = ContractFitStatus.NO_DATA,
     contracts_available: int | None = None,
+    ships_status: str = ShipsStatus.NO_DATA,
 ) -> None:
-    """Запись кэша расчёта в Fit (контракты + рынок + last_checked_at)."""
+    """Запись кэша расчёта в Fit (контракты + рынок + общий статус + last_checked_at)."""
     fit.status_cache = status
     fit.fits_available = k
     fit.total_cost = total_cost
     fit.overprice_count = overprice_count
     fit.contracts_status_cache = contracts_status
     fit.contracts_available = contracts_available
+    fit.ships_status_cache = ships_status
     fit.last_checked_at = timezone.now()
     fit.save(
         update_fields=[
@@ -536,6 +568,7 @@ def _save_fit_cache(
             "overprice_count",
             "contracts_status_cache",
             "contracts_available",
+            "ships_status_cache",
             "last_checked_at",
         ]
     )
@@ -558,6 +591,14 @@ def recalc_fit(fit: Fit) -> FitCalcResult:
     component_rows_data, all_components_have_data = _component_inputs(fit, scope_cache)
     component_rows = component_rows_data
     if not component_rows:
+        # Без состава рыночная собираемость неизвестна — общий статус no_data (§6.13, §20.43).
+        ships = get_ships_availability(
+            fit,
+            contracts_available=contracts_res.ships_available,
+            market_available=None,
+            contracts_status=contracts_res.status,
+            market_status=FitStatus.NO_DATA,
+        )
         _save_fit_cache(
             fit,
             FitStatus.NO_DATA,
@@ -566,6 +607,7 @@ def recalc_fit(fit: Fit) -> FitCalcResult:
             None,
             contracts_status=contracts_res.status,
             contracts_available=contracts_res.ships_available,
+            ships_status=ships.ships_status,
         )
         return FitCalcResult(
             FitStatus.NO_DATA,
@@ -577,6 +619,7 @@ def recalc_fit(fit: Fit) -> FitCalcResult:
             contracts_available=contracts_res.ships_available,
             contracts_deficit=contracts_res.deficit,
             contracts_reasons=contracts_reasons,
+            ships_availability=ships,
         )
 
     # Нужные локации — объединение областей всех компонентов (в т.ч. override);
@@ -599,6 +642,14 @@ def recalc_fit(fit: Fit) -> FitCalcResult:
         # NO_DATA: локация не свежа (§6.7) или агрегат StockLevel отсутствует
         # по нужной локации (§6.7); дефицит и стоимость не считаются (§6.4).
         status = engine.STATUS_NO_DATA
+        # K неизвестен: общий статус no_data независимо от контрактов (решение №43).
+        ships = get_ships_availability(
+            fit,
+            contracts_available=contracts_res.ships_available,
+            market_available=None,
+            contracts_status=contracts_res.status,
+            market_status=status,
+        )
         _save_fit_cache(
             fit,
             status,
@@ -607,6 +658,7 @@ def recalc_fit(fit: Fit) -> FitCalcResult:
             None,
             contracts_status=contracts_res.status,
             contracts_available=contracts_res.ships_available,
+            ships_status=ships.ships_status,
         )
         return FitCalcResult(
             status,
@@ -619,6 +671,7 @@ def recalc_fit(fit: Fit) -> FitCalcResult:
             contracts_available=contracts_res.ships_available,
             contracts_deficit=contracts_res.deficit,
             contracts_reasons=contracts_reasons,
+            ships_availability=ships,
         )
 
     # Стаканы и ref по каждому типу — из кэша JitaOrderLevel, без ESI (§5.10);
@@ -655,6 +708,13 @@ def recalc_fit(fit: Fit) -> FitCalcResult:
     status = engine.calc_fit_status(False, hull_available_calc, k, fit.qty_target, allow_hull_missing=True)
     total_cost = sum((r.cost for r in results), Decimal("0"))
     overprice_count = sum(1 for r in results if r.is_overprice)
+    ships = get_ships_availability(
+        fit,
+        contracts_available=contracts_res.ships_available,
+        market_available=k,
+        contracts_status=contracts_res.status,
+        market_status=status,
+    )
     _save_fit_cache(
         fit,
         status,
@@ -663,15 +723,17 @@ def recalc_fit(fit: Fit) -> FitCalcResult:
         overprice_count,
         contracts_status=contracts_res.status,
         contracts_available=contracts_res.ships_available,
+        ships_status=ships.ships_status,
     )
     logger.debug(
-        "Fit %s recalculated: contracts=%s(%s) market=%s(%s) total=%s",
+        "Fit %s recalculated: contracts=%s(%s) market=%s(%s) ships=%s(%s)",
         fit.pk,
         contracts_res.status,
         contracts_res.ships_available,
         status,
         k,
-        total_cost,
+        ships.ships_status,
+        ships.ships_total,
     )
     return FitCalcResult(
         status,
@@ -684,6 +746,7 @@ def recalc_fit(fit: Fit) -> FitCalcResult:
         contracts_available=contracts_res.ships_available,
         contracts_deficit=contracts_res.deficit,
         contracts_reasons=contracts_reasons,
+        ships_availability=ships,
     )
 
 

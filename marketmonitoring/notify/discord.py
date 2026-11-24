@@ -41,6 +41,21 @@ def canonical_state_hash(payload: dict) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def ships_deficit_state_hash(fit_id: int, ships_status: str, ships_deficit: int | None) -> str:
+    """Канонический хэш состояния ships_deficit (§13.1, решение №42).
+
+    Хэш считается по ``fit_id || ships_status || ships_deficit`` отдельно от
+    хэшей ``deficit`` и ``contracts_deficit`` — старые события не изменяются.
+    """
+    return canonical_state_hash(
+        {
+            "fit_id": fit_id,
+            "ships_status": ships_status,
+            "ships_deficit": ships_deficit,
+        }
+    )
+
+
 def get_webhook_url() -> str | None:
     """Активный webhook (§13): WebhookConfig с enabled=True; иначе None."""
     config = WebhookConfig.objects.filter(enabled=True).first()
@@ -175,6 +190,43 @@ def send_contracts_deficit(
     return send_webhook(
         embed=embed,
         event=NotificationEvent.CONTRACTS_DEFICIT,
+        state_hash=state_hash,
+        fit=fit,
+    )
+
+
+def send_ships_deficit(
+    fit: Fit,
+    ships_in_contracts: int,
+    ships_from_market: int,
+    ships_total: int,
+    n: int,
+    ships_deficit: int,
+    scope_label: str,
+    state_hash: str,
+) -> tuple[bool, str]:
+    """Уведомление ships_deficit (§13): C, K, C+K, нехватка, область, ссылка.
+
+    Отправляется только при beat и ``ships_status_cache='deficit'``;
+    дедупликация по хэшу состояния либо кулдауну выполняется вызывающим
+    (tasks.notify_deficit). Хэши и тексты deficit/contracts_deficit не меняются.
+    """
+    fields = [
+        {"name": "Ships available (C+K)", "value": f"{ships_total}/{n}", "inline": True},
+        {"name": "Missing ships", "value": str(ships_deficit), "inline": True},
+        {"name": "On contracts (C)", "value": str(ships_in_contracts), "inline": True},
+        {"name": "From market (K)", "value": str(ships_from_market), "inline": True},
+        {"name": "Scope", "value": scope_label, "inline": False},
+    ]
+    embed = {
+        "title": f"SHIPS DEFICIT: {fit.name}",
+        "color": COLOR_DEFICIT,
+        "url": _card_url(fit),
+        "fields": fields,
+    }
+    return send_webhook(
+        embed=embed,
+        event=NotificationEvent.SHIPS_DEFICIT,
         state_hash=state_hash,
         fit=fit,
     )

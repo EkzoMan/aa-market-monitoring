@@ -336,3 +336,77 @@ def calc_contracts_fit(
         deficit=deficit,
         matched_contracts=matched,
     )
+
+
+@dataclass(frozen=True)
+class ShipsAvailabilityResult:
+    """Итоговая доступность кораблей C+K по фиту (§6.13, решение №44).
+
+    ``is_partial`` истинно, если хотя бы один источник (контракты или рынок)
+    имеет статус ``no_data``/неизвестное значение: в этом случае итог и
+    агрегатный дефицит не рассчитываются (решение №43).
+    """
+
+    ships_in_contracts: int | None
+    ships_from_market: int | None
+    ships_total: int | None
+    ships_deficit: int | None
+    ships_status: str
+    is_partial: bool
+
+
+def calc_ships_total(contracts_available: int | None, market_available: int | None) -> int | None:
+    """Итог доступных кораблей C+K (§6.13): C из контрактов, K с рынка.
+
+    Возвращает None, если любая из величин неизвестна; Jita в доступность
+    не входит (решение №39).
+    """
+    if contracts_available is None or market_available is None:
+        return None
+    return contracts_available + market_available
+
+
+def calc_ships_deficit(qty_target: int, contracts_available: int | None, market_available: int | None) -> int | None:
+    """Агрегатный дефицит max(0, N-(C+K)) (§6.13); None при неизвестном C или K."""
+    total = calc_ships_total(contracts_available, market_available)
+    if total is None:
+        return None
+    return max(0, qty_target - total)
+
+
+def calc_ships_availability(
+    qty_target: int,
+    contracts_available: int | None,
+    market_available: int | None,
+    contracts_status: str | None,
+    market_status: str | None,
+) -> ShipsAvailabilityResult:
+    """Сводная доступность кораблей: итог, агрегатный дефицит и общий статус (§6.13).
+
+    Статус ``no_data`` при любом неизвестном значении/статусе ``no_data``;
+    иначе ``deficit`` при агрегатном дефиците > 0, иначе ``ok``. Рыночный
+    статус ``hull_missing`` не является ``no_data``: K уже посчитан, общий
+    статус определяется только дефицитом C+K (решение №43).
+    """
+    has_no_data = (
+        contracts_available is None
+        or market_available is None
+        or contracts_status in (None, "", STATUS_NO_DATA)
+        or market_status in (None, "", STATUS_NO_DATA)
+    )
+    total = None if has_no_data else calc_ships_total(contracts_available, market_available)
+    deficit = None if has_no_data else calc_ships_deficit(qty_target, contracts_available, market_available)
+    if has_no_data:
+        status = STATUS_NO_DATA
+    elif deficit is not None and deficit > 0:
+        status = STATUS_DEFICIT
+    else:
+        status = STATUS_OK
+    return ShipsAvailabilityResult(
+        ships_in_contracts=contracts_available,
+        ships_from_market=market_available,
+        ships_total=total,
+        ships_deficit=deficit,
+        ships_status=status,
+        is_partial=has_no_data,
+    )

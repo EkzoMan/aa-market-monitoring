@@ -18,14 +18,18 @@
 | `data_stale_after_min` | Integer | 180 | ≥ 5 | Порог свежести данных: устаревание даёт статус `NO_DATA` |
 | `provider_acl_cooldown_min` | Integer | 60 | 1…1440 | Cooldown провайдера при ACL-сбое (403/401) |
 | `provider_acl_max_failures` | Integer | 3 | 1…10 | Число ACL-сбоев до автоматического отключения провайдера |
-| `notification_deficit_enabled` | Boolean | True | — | Отправка уведомлений о дефиците (только при trigger=beat) |
-| `notification_deficit_cooldown_min` | Integer | 120 | 1…1440 | Cooldown повторного уведомления о неизменном дефиците |
+| `notification_deficit_enabled` | Boolean | True | — | Отправка уведомлений `deficit` **и `ships_deficit`** (только при trigger=beat); `contracts_deficit` управляется отдельным `notification_contracts_deficit_enabled` |
+| `notification_deficit_cooldown_min` | Integer | 120 | 1…1440 | Общий cooldown повторной отправки неизменного `deficit`, `contracts_deficit` и `ships_deficit` |
 | `webhook_url` | URL | — (пусто) | один канал | Discord webhook для уведомлений |
 | `display_language_mode` | Enum | `client_default` | `client_default` \| `fixed_en` | Язык имён типов: `client_default` — `LANGUAGE_CODE` пользователя (fallback `en`); `fixed_en` — всегда английский |
+| `contracts_sync_interval_min` | Integer | 30 | 5…1440 | Guard-интервал задачи `sync_contracts` (контракты — источник C) |
+| `notification_contracts_deficit_enabled` | Boolean | True | — | Отправка уведомлений `contracts_deficit` (только при trigger=beat) |
+
+Отдельной настройки включения или кулдауна для `ships_deficit` **нет**: новое событие делит `notification_deficit_enabled` и `notification_deficit_cooldown_min` с `deficit` (и тот же cooldown с `contracts_deficit`).
 
 ### Изменение интервалов без перезапуска beat
 
-Beat дёргает задачи синка каждые 5 минут; каждая задача сама проверяет по `SyncRun`, истёк ли её guard-интервал (`jita_sync_interval_min`, `stock_sync_interval_min`, 60 мин для `verify_providers`, 24 ч для `cleanup_orphan_cache`). Поэтому изменение интервалов в настройках применяется к следующему прогону **без перезапуска Celery beat**. То же верно для остальных настроек (наценка, пороги, глубина стакана, webhook).
+Beat дёргает задачи синка каждые 5 минут; каждая задача сама проверяет по `SyncRun`, истёк ли её guard-интервал (`jita_sync_interval_min`, `stock_sync_interval_min`, `contracts_sync_interval_min`, 60 мин для `verify_providers`, 24 ч для `cleanup_orphan_cache` и `sync_corp_structures`). Поэтому изменение интервалов в настройках применяется к следующему прогону **без перезапуска Celery beat**. То же верно для остальных настроек (наценка, пороги, глубина стакана, webhook). Рыночные синки и `sync_contracts` включены в beat.
 
 ## Роли
 
@@ -40,6 +44,7 @@ Beat дёргает задачи синка каждые 5 минут; кажд�
 | Ручной запуск обновления («Обновить сейчас») | — | ✅ | ✅ |
 | Настройки плагина (наценка, пороги, интервалы, webhook) | — | ✅ | ✅ |
 | Привязка/отзыв/включение `StructureProvider` | — | ✅ | ✅ |
+| Привязка/отзыв/включение `ContractProvider` | — | ✅ | ✅ |
 | Просмотр лога синков (`SyncRun`) | — | — | ✅ (только `/admin/`) |
 
 ## Провайдеры структур
@@ -63,6 +68,10 @@ Beat дёргает задачи синка каждые 5 минут; кажд�
 
 Провайдер в статусе `disabled` включается **только вручную** через форму провайдеров; при включении счётчик сбоев сбрасывается. Задача `verify_providers` (раз в час) проверяет доступ провайдера к структурам через ESI и обновляет `last_verified_at`; счётчик сбоев меняется только при фактическом 403/401.
 
+### Провайдеры контрактов
+
+`ContractProvider` — персонаж AA с источником `corporation` (корпоративные и альянсовые контракты) или `character` (персональные); токены плагин не хранит, используются токены AA. Задача `sync_contracts` (guard — `contracts_sync_interval_min`) кэширует открытые `item_exchange` контракты и их позиции, дедуплицируя по `contract_id`. Нет включённого провайдера с свежим успешным синком (`sync_status = ok`, `last_synced_at >= now - data_stale_after_min`) → `contracts_status_cache = no_data` → общий `ships_status_cache = no_data`: фит исключается из сводных сумм C+K.
+
 ## Discord webhook
 
 Настраивается один webhook (`webhook_url`) — один канал. HTTP POST JSON (`requests`), таймаут 10 с, 3 ретрая с backoff 2/4/8 с; результат пишется в `NotificationLog` (`ok`, `error`). Пример значения (маскировано):
@@ -76,16 +85,20 @@ https://discord.com/api/webhooks/1234567890/XXXXXXXXXXXXXXXXXXXXXXXX
 | Событие | Когда | Цвет embed |
 |---|---|---|
 | `deficit` | beat-проверка, K < N: фит, K/N, узкие места (до 5), сумма докупки, число оверпрайс-позиций, ссылка | оранжевый |
+| `contracts_deficit` | beat-проверка, C < N: фит, C/N кораблей в контрактах, нехватка N−C, область, ссылка | оранжевый |
+| `ships_deficit` | beat-проверка, `ships_status_cache='deficit'` (C+K < N): фит, C+K и N, нехватка N−(C+K), раздельно C и K, область, ссылка | оранжевый |
 | `hull_missing` | корпус отсутствует в области | красный |
 | `provider_acl_lost` | ACL-сбой / отключение провайдера | красный |
 | `sync_failed` | задача упала / превышен порог ошибок (только при переходе состояния) | красный |
 | `sync_recovered` | успешный прогон после серии failed (с длительностью простоя) | зелёный |
 
-Дедупликация `deficit`: уведомление отправляется, если изменился хэш состояния (fit_id ‖ K ‖ набор дефицитных типов ‖ округлённый Total) **или** прошло ≥ `notification_deficit_cooldown_min` с последней ok-отправки при сохраняющемся дефиците. Системные события отправляются только при переходе состояния. Уведомления о дефиците — **только при автоматическом (beat) запуске**; ручной запуск их не порождает.
+Дедупликация `deficit`: уведомление отправляется, если изменился хэш состояния (fit_id ‖ K ‖ набор дефицитных типов ‖ округлённый Total) **или** прошло ≥ `notification_deficit_cooldown_min` с последней ok-отправки при сохраняющемся дефиците. У `contracts_deficit` свой хэш (fit_id ‖ C ‖ N) и свой флаг включения `notification_contracts_deficit_enabled`, но тот же cooldown. У `ships_deficit` свой хэш (fit_id ‖ `ships_status` ‖ `ships_deficit`); отправка при изменении хэша либо по `notification_deficit_cooldown_min`, управление — через `notification_deficit_enabled`. Хэши и записи `NotificationLog` у трёх событий независимы: изменение одного не перезаписывает состояние другого. Системные события (`provider_acl_lost`, `sync_failed`, `sync_recovered`) отправляются только при переходе состояния. Уведомления о дефиците — **только при автоматическом (beat) запуске**; ручной запуск их не порождает, включая `ships_deficit`.
 
 ## Диагностика NO_DATA
 
 `NO_DATA` означает: хотя бы одна локация, нужная для расчёта, не имеет свежих данных. При этом дефицит и стоимость **не считаются**, уведомление о дефиците не отправляется; в UI показывается причина и баннер.
+
+Для сводки C+K действует то же правило на уровне источников: `no_data` у C (нет включённого `ContractProvider` либо нет свежей успешной синхронизации) или у K (причины ниже) даёт `ships_status_cache='no_data'`. Агрегатный дефицит в этом случае не считается, `ships_deficit` не отправляется, фит исключается из `∑C`, `∑K` и `∑(C+K)`.
 
 ### Причины (§6.7 ТЗ)
 
@@ -107,5 +120,6 @@ https://discord.com/api/webhooks/1234567890/XXXXXXXXXXXXXXXXXXXXXXXX
 | `stale` / давно нет `last_synced_at` | Проверить, что Celery worker и beat работают; нажать «Обновить сейчас»; проверить `SyncRun` в admin |
 | Задачи `failed` | Текст ошибки в `SyncRun.errors`; часто — лимиты ESI (задача переносится на следующий прогон) или неверные токены AA |
 | Регион синк OK, но `NO_DATA` | Проверить, что `data_stale_after_min` больше интервала синка и что регион локации входит в синк (объединение регионов включённых локаций и областей расчёта) |
+| `ships_status_cache='no_data'` при исправном рынке | Проверить `contracts_status_cache`: включить `ContractProvider` с нужными скоупами и дождаться успешного `sync_contracts` в интервале `data_stale_after_min` |
 
 Примечание: ESI кэширует ответы (регион ≈ 5 мин, структуры ≈ 30 мин) — это ожидаемое поведение.

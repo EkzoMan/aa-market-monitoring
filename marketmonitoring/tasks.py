@@ -20,6 +20,7 @@ from .constants import (
     LocationKind,
     NotificationEvent,
     ScopeKind,
+    ShipsStatus,
     SourceKind,
     SyncRunStatus,
     SyncStatus,
@@ -66,21 +67,24 @@ BEAT_CLEANUP_INTERVAL_SECONDS = 86400
 def build_beat_schedule() -> dict:
     """Фабрика beat-расписания (§12.2) — для документации и конфигурации Celery beat.
 
-    Каждые 5 минут: sync_contracts, verify_providers (и notify_deficit —
-    уведомления о дефиците только при trigger=beat, §12.4). Ежедневно:
-    cleanup_orphan_cache. Фактические интервалы выполнения проверяются
-    guard'ами задач (§10, §12.2): guard-интервалы CLEANUP_INTERVAL_HOURS /
-    VERIFY_PROVIDERS_INTERVAL_MIN и contracts_sync_interval_min не позволят
-    задаче выполниться чаще, чем разрешено, даже при более частом beat-тике.
-
-    Рыночные синки sync_jita_book / sync_region_orders / sync_structure_orders
-    временно отключены (задачи сохранены, запускаются только напрямую).
+    Каждые 5 минут: sync_jita_book, sync_region_orders, sync_structure_orders,
+    sync_contracts, verify_providers (и notify_deficit — уведомления о
+    дефиците только при trigger=beat, §12.4). Ежедневно: cleanup_orphan_cache.
+    Фактические интервалы выполнения проверяются guard'ами задач (§10, §12.2):
+    guard'ы по jita_sync_interval_min / stock_sync_interval_min /
+    contracts_sync_interval_min / CLEANUP_INTERVAL_HOURS /
+    VERIFY_PROVIDERS_INTERVAL_MIN не позволят задаче выполниться чаще,
+    чем разрешено, даже при более частом beat-тике.
     """
     every_five_minutes = {
         "schedule": BEAT_SYNC_INTERVAL_SECONDS,
         "options": {"trigger": TriggerKind.BEAT},
     }
     return {
+        "marketmonitoring-sync-jita-book": every_five_minutes | {"task": "marketmonitoring.sync_jita_book"},
+        "marketmonitoring-sync-region-orders": every_five_minutes | {"task": "marketmonitoring.sync_region_orders"},
+        "marketmonitoring-sync-structure-orders": every_five_minutes
+        | {"task": "marketmonitoring.sync_structure_orders"},
         "marketmonitoring-sync-contracts": {**every_five_minutes, "task": "marketmonitoring.sync_contracts"},
         "marketmonitoring-verify-providers": every_five_minutes | {"task": "marketmonitoring.verify_providers"},
         "marketmonitoring-notify-deficit": every_five_minutes | {"task": "marketmonitoring.notify_deficit"},
@@ -1134,7 +1138,7 @@ def notify_deficit(self, trigger: str = TriggerKind.BEAT) -> dict:
     try:
         from eveuniverse.models import EveType  # noqa: E402 — SDE-справочник (§7)
 
-        from .calc.service import recalc_fit
+        from .calc.service import get_ships_availability, recalc_fit
         from .constants import FitStatus
         from .models import NotificationLog
         from .notify import discord
@@ -1159,6 +1163,11 @@ def notify_deficit(self, trigger: str = TriggerKind.BEAT) -> dict:
                 invalid += 1
                 continue
             result = recalc_fit(fit)
+            # Общий статус уже записан recalc_fit в Fit.ships_status_cache;
+            # результат ядра переиспользуем, а для моков/старых вызовов читаем кэш.
+            ships = getattr(result, "ships_availability", None)
+            if ships is None:
+                ships = get_ships_availability(fit)
             if (
                 result.contracts_status == ContractFitStatus.DEFICIT
                 and result.contracts_available is not None
@@ -1222,20 +1231,23 @@ def notify_deficit(self, trigger: str = TriggerKind.BEAT) -> dict:
                         "total": str(rounded_total),
                     }
                 )
-                if not _deficit_notification_due(fit.pk, state_hash, settings_obj.notification_deficit_cooldown_min):
-                    skipped += 1
-                    continue
-                ok, _error = discord.send_deficit(
-                    fit=fit,
-                    k=result.k,
-                    n=fit.qty_target,
-                    bottlenecks=bottleneck_names,
-                    total_cost=result.total_cost,
-                    overprice_count=result.overprice_count or 0,
-                    state_hash=state_hash,
+                deficit_due = _deficit_notification_due(
+                    fit.pk, state_hash, settings_obj.notification_deficit_cooldown_min
                 )
-                if ok:
-                    sent += 1
+                if not deficit_due:
+                    skipped += 1
+                if deficit_due:
+                    ok, _error = discord.send_deficit(
+                        fit=fit,
+                        k=result.k,
+                        n=fit.qty_target,
+                        bottlenecks=bottleneck_names,
+                        total_cost=result.total_cost,
+                        overprice_count=result.overprice_count or 0,
+                        state_hash=state_hash,
+                    )
+                    if ok:
+                        sent += 1
             elif result.status == FitStatus.HULL_MISSING:
                 # hull_missing (§13): только при переходе состояния (§13.1) —
                 # дедуп по последней ok-записи с тем же state_hash.
@@ -1251,6 +1263,43 @@ def notify_deficit(self, trigger: str = TriggerKind.BEAT) -> dict:
                 ok, _error = discord.send_hull_missing(fit=fit, scope_label=scope_label, state_hash=state_hash)
                 if ok:
                     sent += 1
+
+            # ships_deficit (§13, решение №42): только beat и общий статус deficit.
+            # Старые события deficit/contracts_deficit и их хэши не изменяются.
+            if (
+                ships.ships_status == ShipsStatus.DEFICIT
+                and ships.ships_total is not None
+                and ships.ships_deficit is not None
+                and ships.ships_in_contracts is not None
+                and ships.ships_from_market is not None
+                and settings_obj.notification_deficit_enabled
+            ):
+                ships_scope_label = f"{fit.scope_kind} {fit.scope_ref}"
+                ships_hash = discord.ships_deficit_state_hash(
+                    fit_id=fit.pk,
+                    ships_status=ships.ships_status,
+                    ships_deficit=ships.ships_deficit,
+                )
+                if _deficit_notification_due(
+                    fit.pk,
+                    ships_hash,
+                    settings_obj.notification_deficit_cooldown_min,
+                    event=NotificationEvent.SHIPS_DEFICIT,
+                ):
+                    ok_s, _err_s = discord.send_ships_deficit(
+                        fit=fit,
+                        ships_in_contracts=ships.ships_in_contracts,
+                        ships_from_market=ships.ships_from_market,
+                        ships_total=ships.ships_total,
+                        n=fit.qty_target,
+                        ships_deficit=ships.ships_deficit,
+                        scope_label=ships_scope_label,
+                        state_hash=ships_hash,
+                    )
+                    if ok_s:
+                        sent += 1
+                else:
+                    skipped += 1
         _finish_run(run, status=SyncRunStatus.OK, items_processed=sent)
         return {"ok": True, "sent": sent, "skipped": skipped, "invalid": invalid}
     except Exception as exc:  # noqa: BLE001
@@ -1265,9 +1314,9 @@ def _deficit_notification_due(
     cooldown_min: int,
     event: str = NotificationEvent.DEFICIT,
 ) -> bool:
-    """Дедупликация deficit / contracts_deficit (§13.1): отправлять, если состояние
-    изменилось с последней ok-отправки ИЛИ прошло >= cooldown_min с неё при
-    сохраняющемся дефиците. Ни одной ok-отправки — отправлять."""
+    """Дедупликация deficit / contracts_deficit / ships_deficit (§13.1): отправлять,
+    если состояние изменилось с последней ok-отправки ИЛИ прошло >= cooldown_min
+    с неё при сохраняющемся дефиците. Ни одной ok-отправки — отправлять."""
     from .models import NotificationLog
 
     last_ok = NotificationLog.objects.filter(event=event, fit_id=fit_id, ok=True).order_by("-sent_at", "-id").first()
