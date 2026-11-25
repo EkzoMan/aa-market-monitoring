@@ -194,17 +194,43 @@ def test_export_multibuy_endpoint(eve_types, viewer_client, db):  # noqa: F811
     assert data["text"] == ""
 
 
-def test_calc_export_rows_empty_when_jita_disabled(eve_types, db):  # noqa: F811
-    """Выключенная Jita: закупка недоступна — calc_export_rows возвращает [].
+def test_export_keeps_deficit_when_jita_disabled(eve_types, viewer_client, db):  # noqa: F811
+    """Без Jita цены нет, но список докупки обязан содержать дефицит (требование заказчика).
 
-    Локальный дефицит и StockLevel остаются свежими: пустой экспорт вызван
-    именно отсутствием цены докупки, а не NO_DATA рыночных локаций.
+    Локальный дефицит и StockLevel остаются свежими: проверяем, что экспорт
+    не зависит от цены докупки и не блокируется выключенной локацией Jita.
     """
     _seed_market(db)
     fit = _deficit_fit(db)
     MarketLocation.objects.filter(station_id=STATION_ID).update(enabled=False)
 
-    assert calc_export_rows(fit) == []
+    rows = calc_export_rows(fit)
+    assert [(row["type_id"], row["qty"]) for row in rows] == [(2046, 1)]
+    assert rows[0]["unit_price"] is None
+    assert rows[0]["cost"] is None
+
+    txt = viewer_client.get(reverse("marketmonitoring:export_txt", args=[fit.pk]))
+    assert txt.content.decode("utf-8") == "Damage Control II\t1\n"
+    csv_response = viewer_client.get(reverse("marketmonitoring:export_csv", args=[fit.pk]))
+    lines = csv_response.content.decode("utf-8").strip().split("\n")
+    assert lines == ["type_name,type_id,qty,unit_price,cost", "Damage Control II,2046,1,,"]
+
+    multibuy = viewer_client.get(reverse("marketmonitoring:export_multibuy", args=[fit.pk])).json()
+    assert multibuy == {"empty": False, "text": "Damage Control II\t1\n", "count": 1}
+
+
+def test_fit_detail_exposes_export_buttons_and_empty_hint(eve_types, viewer_client, db):  # noqa: F811
+    """Карточка фита: кнопки экспорта и видимое сообщение «нет дефицита» (§14.3)."""
+    _seed_market(db)
+    fit = _deficit_fit(db)
+
+    content = viewer_client.get(reverse("marketmonitoring:fit_detail", args=[fit.pk])).content.decode("utf-8")
+
+    assert f'data-url="{reverse("marketmonitoring:export_multibuy", args=[fit.pk])}"' in content
+    assert f'href="{reverse("marketmonitoring:export_txt", args=[fit.pk])}"' in content
+    assert f'href="{reverse("marketmonitoring:export_csv", args=[fit.pk])}"' in content
+    assert 'id="mm-multibuy-empty"' in content
+    assert "No deficit positions to export." in content
 
 
 def test_export_empty_deficit_files(eve_types, viewer_client, db):  # noqa: F811

@@ -14,9 +14,15 @@ from django.urls import reverse
 from ..auth_hooks import GROUP_EDIT, GROUP_VIEW
 from ..models import Fit
 from ..views import dashboard as dashboard_view
-from .test_calc_engine import sde_ids  # noqa: F401 — справочники eveuniverse (система/станции)
+from .test_calc_engine import (  # noqa: F401 — справочники eveuniverse (система/станции)
+    sde_ids,
+)
 from .test_eft_parser import eve_types  # noqa: F401 — записи EveType
-from .test_ships_availability import _no_esi, _seed_full_kit_contracts, _seed_reference_market
+from .test_ships_availability import (
+    _no_esi,
+    _seed_full_kit_contracts,
+    _seed_reference_market,
+)
 
 pytestmark = pytest.mark.django_db
 
@@ -70,10 +76,10 @@ def fit_with_component(eve_types, sde_ids):  # noqa: F811
 
 
 def _dashboard_cell(html, column_index):
-    """Ячейка <td> первой строки таблицы фитов дашборда по нумерации колонок."""
+    """Ячейка <td> первой строки таблицы фитов; индекс — без колонки чекбокса."""
     tbody = html.split("<tbody>", 1)[1].split("</tbody>", 1)[0]
     first_row = tbody.split("<tr>", 1)[1].split("</tr>", 1)[0]
-    return re.findall(r"<td[^>]*>(.*?)</td>", first_row, flags=re.S)[column_index]
+    return re.findall(r"<td[^>]*>(.*?)</td>", first_row, flags=re.S)[column_index + 1]
 
 
 def test_dashboard_uses_semantic_bootstrap_badges(viewer_client, fit_with_component):
@@ -140,7 +146,8 @@ def test_dashboard_has_no_total_to_buy_or_overprice_columns(viewer_client, fit_w
     assert "Overprice" not in content
     tbody = content.split("<tbody>", 1)[1].split("</tbody>", 1)[0]
     first_row = tbody.split("<tr>", 1)[1].split("</tr>", 1)[0]
-    assert len(re.findall(r"<td\b", first_row)) == 9
+    # Колонка чекбокса сводной закупки добавила одну ячейку к уже существующим девяти.
+    assert len(re.findall(r"<td\b", first_row)) == 10
 
 
 def test_dashboard_ships_availability_without_n_plus_one(viewer_client, sde_ids, monkeypatch):  # noqa: F811

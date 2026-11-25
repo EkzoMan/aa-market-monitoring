@@ -243,6 +243,9 @@
 <div id="mm-copy-failed" class="alert alert-warning mt-2 d-none">
   {% translate "Copy failed — use .txt export" %}
 </div>
+<div id="mm-multibuy-empty" class="alert alert-info mt-2 d-none">
+  {% translate "No deficit positions to export." %}
+</div>
 
 {# Копирование multibuy (§14.3): Clipboard API, fallback execCommand, без CDN. #}
 <script>
@@ -251,13 +254,22 @@
     if (!btn) return;
     var toastEl = document.getElementById("mm-copied-toast");
     var failed = document.getElementById("mm-copy-failed");
+    var empty = document.getElementById("mm-multibuy-empty");
     function showCopied() {
       failed.classList.add("d-none");
+      empty.classList.add("d-none");
       if (window.bootstrap && window.bootstrap.Toast) {
         window.bootstrap.Toast.getOrCreateInstance(toastEl, {delay: 2000}).show();
       }
     }
-    function showFailed() { failed.classList.remove("d-none"); }
+    function showFailed() {
+      empty.classList.add("d-none");
+      failed.classList.remove("d-none");
+    }
+    function showEmpty() {
+      failed.classList.add("d-none");
+      empty.classList.remove("d-none");
+    }
     function legacyCopy(text) {
       var ta = document.createElement("textarea");
       ta.value = text;
@@ -283,7 +295,7 @@
       fetch(btn.dataset.url, {credentials: "same-origin"})
         .then(function (r) { return r.json(); })
         .then(function (data) {
-          if (data.empty || !data.text) { showFailed(); return; }
+          if (data.empty || !data.text) { showEmpty(); return; }
           copyText(data.text);
         })
         .catch(showFailed);

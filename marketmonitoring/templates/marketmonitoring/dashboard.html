@@ -143,16 +143,34 @@
   <div class="card-header d-flex flex-wrap align-items-center gap-2">
     <h3 class="card-title mb-0">{% translate "Fits" %}</h3>
     <span class="badge text-bg-secondary">{{ fit_count }}</span>
-    {# Кнопка добавления живёт в шапке всегда (для edit-роли), а не только в пустом состоянии. #}
-    {% if can_edit %}
-    <a href="{% url 'marketmonitoring:fit_create' %}" class="btn btn-primary btn-sm ms-auto">{% translate "+ New fit" %}</a>
-    {% endif %}
+    {# Сводный multibuy по выбранным фитам (заказчик): чекбоксы в таблице + буфер/.txt. #}
+    <div class="d-flex flex-wrap align-items-center gap-2 ms-auto">
+      {% if rows %}
+      <span class="d-none">{% csrf_token %}</span>
+      <button type="button" id="mm-bulk-multibuy-btn" class="btn btn-primary btn-sm"
+              data-url="{% url 'marketmonitoring:export_bulk_multibuy' %}">
+        <i class="fas fa-copy me-1" aria-hidden="true"></i>{% translate "Copy multibuy" %}
+      </button>
+      <button type="button" id="mm-bulk-txt-btn" class="btn btn-outline-secondary btn-sm"
+              data-url="{% url 'marketmonitoring:export_bulk_txt' %}">
+        <i class="fas fa-file-arrow-down me-1" aria-hidden="true"></i>{% translate "Selected .txt" %}
+      </button>
+      <span id="mm-bulk-export-status" class="small text-body-secondary d-none" role="status" aria-live="polite"></span>
+      {% endif %}
+      {# Кнопка добавления живёт в шапке всегда (для edit-роли), а не только в пустом состоянии. #}
+      {% if can_edit %}
+      <a href="{% url 'marketmonitoring:fit_create' %}" class="btn btn-primary btn-sm">{% translate "+ New fit" %}</a>
+      {% endif %}
+    </div>
   </div>
   <div class="card-body table-responsive">
     {% if rows %}
     <table class="table table-sm table-hover align-middle mm-table">
       <thead>
         <tr>
+          <th class="mm-select-col">
+            <input type="checkbox" id="mm-select-all" aria-label="{% translate 'Select all fits' %}">
+          </th>
           <th>{% translate "Fit" %}</th>
           {# Collectability = C+K (§6.13, решение №40): единая колонка итога; дубль «Ships total (C+K)» удалён. #}
           <th>{% translate "Collectability (C+K)" %}</th>
@@ -169,6 +187,10 @@
       <tbody>
         {% for row in rows %}
         <tr>
+          <td class="mm-select-col">
+            <input type="checkbox" class="mm-fit-check" value="{{ row.fit.pk }}"
+                   aria-label="{% translate 'Select fit' %} {{ row.fit.name }}">
+          </td>
           <td>
             <span class="mm-nowrap"><a href="{% url 'marketmonitoring:fit_detail' row.fit.pk %}">{{ row.fit.name }}</a></span>
             {# Локация без данных — жёлтое предупреждение внутри строки таблицы; чип статуса фита не меняется (№45). #}
@@ -271,6 +293,94 @@
   if (btn && btn.disabled) { poll(); return; }
   if (btn) {
     btn.addEventListener("click", function () { started = Date.now(); poll(); });
+  }
+})();
+</script>
+
+{# Сводный multibuy по выбранным фитам: сервер считает D_i, JS только копирует/скачивает (§14.3). #}
+<script>
+(function () {
+  var copyBtn = document.getElementById("mm-bulk-multibuy-btn");
+  var txtBtn = document.getElementById("mm-bulk-txt-btn");
+  var selectAll = document.getElementById("mm-select-all");
+  var status = document.getElementById("mm-bulk-export-status");
+  if (!copyBtn && !txtBtn) { return; }
+
+  function checkedIds() {
+    return Array.prototype.slice.call(document.querySelectorAll(".mm-fit-check:checked"))
+      .map(function (input) { return input.value; });
+  }
+  function setStatus(text, isError) {
+    if (!status) { return; }
+    status.textContent = text;
+    status.classList.remove("d-none", "text-danger", "text-body-secondary");
+    status.classList.add(isError ? "text-danger" : "text-body-secondary");
+  }
+  function csrfToken() {
+    var input = document.querySelector('input[name="csrfmiddlewaretoken"]');
+    if (input) { return input.value; }
+    var match = document.cookie.match(/(?:^|;\s*)csrftoken=([^;]+)/);
+    return match ? decodeURIComponent(match[1]) : "";
+  }
+  function fallbackCopy(text) {
+    var area = document.createElement("textarea");
+    area.value = text;
+    area.style.position = "fixed";
+    area.style.opacity = "0";
+    document.body.appendChild(area);
+    area.select();
+    var ok = false;
+    try { ok = document.execCommand("copy"); } catch (e) { ok = false; }
+    document.body.removeChild(area);
+    return ok;
+  }
+
+  if (selectAll) {
+    selectAll.addEventListener("change", function () {
+      var boxes = document.querySelectorAll(".mm-fit-check");
+      for (var i = 0; i < boxes.length; i++) { boxes[i].checked = selectAll.checked; }
+    });
+  }
+  if (txtBtn) {
+    txtBtn.addEventListener("click", function () {
+      var ids = checkedIds();
+      if (!ids.length) { setStatus("{% translate 'Select at least one fit.' %}", true); return; }
+      var url = new URL(txtBtn.dataset.url, window.location.origin);
+      ids.forEach(function (id) { url.searchParams.append("fit_ids", id); });
+      window.location.href = url.toString();
+    });
+  }
+  if (copyBtn) {
+    copyBtn.addEventListener("click", function () {
+      var ids = checkedIds();
+      if (!ids.length) { setStatus("{% translate 'Select at least one fit.' %}", true); return; }
+      setStatus("{% translate 'Preparing purchase list…' %}", false);
+      fetch(copyBtn.dataset.url, {
+        method: "POST",
+        headers: {"Content-Type": "application/json", "X-CSRFToken": csrfToken()},
+        body: JSON.stringify({fit_ids: ids})
+      })
+        .then(function (response) {
+          if (!response.ok) { throw new Error("HTTP " + response.status); }
+          return response.json();
+        })
+        .then(function (data) {
+          if (data.empty) { setStatus("{% translate 'Nothing to buy for the selected fits.' %}", false); return; }
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            return navigator.clipboard.writeText(data.text).then(function () {
+              setStatus("{% translate 'Copied' %} (" + data.count + ")", false);
+            }).catch(function () {
+              var ok = fallbackCopy(data.text);
+              setStatus(ok ? "{% translate 'Copied' %} (" + data.count + ")"
+                           : "{% translate 'Copy failed — use .txt export' %}", !ok);
+            });
+          }
+          var ok = fallbackCopy(data.text);
+          setStatus(ok ? "{% translate 'Copied' %} (" + data.count + ")"
+                       : "{% translate 'Copy failed — use .txt export' %}", !ok);
+        })
+        .catch(function () { setStatus("{% translate 'Copy failed — use .txt export' %}", true); });
+    });
   }
 })();
 </script>

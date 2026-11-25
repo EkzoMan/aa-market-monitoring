@@ -11,6 +11,7 @@ logger = logging.getLogger("marketmonitoring")
 class MarketmonitoringConfig(AppConfig):
     name = "marketmonitoring"
     verbose_name = _("Market Monitoring")
+    locale_dir = "locale"
 
     def ready(self) -> None:
         """Подключение пунктов меню и post_migrate-обработчика назначения прав (§14.4)."""
