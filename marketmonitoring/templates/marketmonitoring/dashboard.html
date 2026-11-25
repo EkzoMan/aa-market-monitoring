@@ -175,9 +175,9 @@
           {# Collectability = C+K (§6.13, решение №40): единая колонка итога; дубль «Ships total (C+K)» удалён. #}
           <th>{% translate "Ships status" %}</th>
           <th>{% translate "Collectability (C+K)" %}</th>
-          <th>{% translate "Ships on market" %}</th>
+          {% comment %} <th>{% translate "Ships on market" %}</th> {% endcomment %}
           <th>{% translate "Contracts status" %}</th>
-          <th>{% translate "Ships on contracts" %}</th>
+          {% comment %} <th>{% translate "Ships on contracts" %}</th> {% endcomment %}
           <th>{% translate "Ships from market (K/N, per fit)" %}</th>          
           {# Столбцы «Total to buy» и «Overprice» удалены из таблицы по требованию пользователя. #}
           <th>{% translate "Bottleneck" %}</th>
@@ -215,7 +215,7 @@
             &mdash;
             {% endif %}
           </td>
-          <td><span class="badge text-bg-{{ row.fit.status_cache|status_class }}">{{ row.fit.get_status_cache_display }}</span></td>
+          {% comment %} <td><span class="badge text-bg-{{ row.fit.status_cache|status_class }}">{{ row.fit.get_status_cache_display }}</span></td> {% endcomment %}
           <td>
             {% if row.fit.contracts_status_cache == 'ok' or row.fit.contracts_status_cache == 'deficit' %}
             <span class="mm-num fw-semibold">{{ row.fit.contracts_available }} <span class="text-body-secondary">{% translate "of" %} {{ row.fit.qty_target }}</span></span>
@@ -227,7 +227,7 @@
             &mdash;
             {% endif %}
           </td>
-          <td><span class="badge text-bg-{{ row.fit.contracts_status_cache|status_class }}">{{ row.fit.get_contracts_status_cache_display }}</span></td>
+          {% comment %} <td><span class="badge text-bg-{{ row.fit.contracts_status_cache|status_class }}">{{ row.fit.get_contracts_status_cache_display }}</span></td> {% endcomment %}
           <td>
             {% if row.ships_from_market is not None %}
             <span class="mm-num fw-semibold">{{ row.ships_from_market }} <span class="text-body-secondary">{% translate "of" %} {{ row.fit.qty_target }}</span></span>
