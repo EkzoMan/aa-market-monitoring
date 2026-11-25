@@ -107,6 +107,7 @@ python manage.py check
 
 Признаки успешной установки:
 
+- шаблоны, статические файлы и каталоги переводов попали в установленный пакет (они объявлены в `pyproject.toml` через `package-data` и в `MANIFEST.in`); если после `pip install` открытие `/marketmonitoring/` падает с `TemplateDoesNotExist: marketmonitoring/dashboard.html`, пакет собран без этих файлов — пересоберите wheel/sdist из актуального репозитория и переустановите его;
 - в меню AA появились пункты **Market Monitoring** и **Components** (видны при наличии права view) и **Locations**/**Settings** (видны при `_edit`);
 - `python manage.py migrate` проходит без ошибок на чистой и существующей БД;
 - в `/admin/` доступны модели плагина (Market locations, Structure providers, Sync runs и др. — суперпользователю);
@@ -120,4 +121,4 @@ python manage.py migrate
 python manage.py collectstatic --noinput
 ```
 
-Перезапуск Celery worker/beat — как обычно для AA. Обратных миграций с потерей данных нет; миграции применяются на существующей БД.
+После замены пакета перезапустите gunicorn (или другой веб-сервер) и Celery worker/beat: процессы, запущенные до обновления, продолжают использовать старую копию шаблонов и статики. Обратных миграций с потерей данных нет; миграции применяются на существующей БД.

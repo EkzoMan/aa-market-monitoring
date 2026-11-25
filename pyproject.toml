@@ -13,9 +13,21 @@ dependencies = [
     "requests>=2.31",
 ]
 
+[tool.setuptools]
+include-package-data = true
+
 [tool.setuptools.packages.find]
 include = ["marketmonitoring*"]
 exclude = ["testproject*"]
+
+# Шаблоны, статические файлы и каталоги переводов должны попадать в wheel/sdist.
+# Без этого Django не находит marketmonitoring/dashboard.html после pip install.
+[tool.setuptools.package-data]
+marketmonitoring = [
+    "templates/**/*.html",
+    "static/**/*",
+    "locale/**/*",
+]
 
 [tool.black]
 line-length = 120
