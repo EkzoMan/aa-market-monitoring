@@ -29,9 +29,7 @@ class FitForm(forms.ModelForm):
     scope_ref_name = forms.CharField(
         label=_("Scope location"),
         required=False,
-        widget=forms.TextInput(
-            attrs={"class": "form-control", "id": "scope-ref-search", "autocomplete": "off"}
-        ),
+        widget=forms.TextInput(attrs={"class": "form-control", "id": "scope-ref-search", "autocomplete": "off"}),
         help_text=_("Start typing a station, system or region name; pick a suggestion."),
     )
 
@@ -302,6 +300,7 @@ class MarketLocationForm(forms.Form):
 # ---------------------------------------------------------------------------
 # Настройки (§10) + webhook + провайдеры (§14)
 # ---------------------------------------------------------------------------
+
 
 class WebhookForm(forms.ModelForm):
     """Форма Discord webhook (§13); доступна только пользователям с правом _edit (§16).

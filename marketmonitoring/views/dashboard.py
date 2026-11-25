@@ -5,6 +5,7 @@ UI обращается только к БД плагина и справочн�
 """
 
 import logging
+import re
 from collections import defaultdict
 
 from django.contrib import messages
@@ -17,9 +18,9 @@ from django.utils.translation import gettext as _
 from ..auth_hooks import has_edit, has_view
 from ..calc import engine
 from ..calc.engine import ComponentInput
-from ..calc.service import get_ships_availability, resolve_scope_ids
+from ..calc.service import _freshness_details, get_ships_availability, resolve_scope_ids
 from ..constants import ContractFitStatus, FitStatus, ScopeKind
-from ..models import Fit, FitComponent, StockLevel, SyncRun
+from ..models import Fit, FitComponent, PluginSetting, StockLevel, SyncRun
 from ..tasks import SYNC_LOCK_KEY
 
 logger = logging.getLogger("marketmonitoring")
@@ -60,15 +61,33 @@ def _scope_labels(scope_pairs: list[tuple[str, int]]) -> dict[tuple[str, int], s
     return {**names, **{pair: f"{pair[0]} {pair[1]}" for pair in scope_pairs if pair not in names}}
 
 
-def _bottlenecks_by_fit(fits_list: list[Fit]) -> dict[int, list[int]]:
-    """Узкие места по каждому фиту (§6.3) — без N+1 (§22.4).
+def _freshness_reasons_by_location(reasons: list[str], location_ids: set[int]) -> dict[int, str]:
+    """Карта id локаций → причина из ``_freshness_details`` (§6.7, решение №45).
+
+    Причины могут группировать несколько id (например, ``locations [...]``
+    или ``region ... (stations [...])``), поэтому разбор идёт по числам внутри
+    строки; учитываются только локации объединения областей дашборда.
+    """
+    mapped: dict[int, str] = {}
+    for reason in reasons:
+        for token in re.findall(r"\d+", reason):
+            location_id = int(token)
+            if location_id in location_ids:
+                mapped.setdefault(location_id, reason)
+    return mapped
+
+
+def _bottlenecks_by_fit(fits_list: list[Fit]) -> tuple[dict[int, list[int]], dict[int, list[str]]]:
+    """Узкие места и предупреждения по каждому фиту (§6.3) — без N+1 (§22.4).
 
     Один запрос компонентов, один резолв на уникальную область, одна выборка
-    StockLevel по всем (type_id, location_id). Собираемость считается чистой
-    функцией engine.calc_fits.
+    StockLevel по всем (type_id, location_id) и один вызов ``_freshness_details``
+    на объединение локаций. Локация без свежих данных даёт нулевой вклад в
+    доступность, но фит не исключается (решение №45); пустая область — NO_DATA
+    и узких мест не имеет. Собираемость считается чистой функцией engine.calc_fits.
     """
     if not fits_list:
-        return {}
+        return {}, {}
     fit_ids = [fit.pk for fit in fits_list]
     components = list(FitComponent.objects.filter(fit_id__in=fit_ids).order_by("pk"))
     comps_by_fit: dict[int, list[FitComponent]] = defaultdict(list)
@@ -80,7 +99,8 @@ def _bottlenecks_by_fit(fits_list: list[Fit]) -> dict[int, list[int]]:
         scopes.add(_fit_scope(fit_by_id[component.fit_id], component))
         type_ids.add(component.type_id)
     if not components:
-        return {fit.pk: [] for fit in fits_list}
+        empty = {fit.pk: [] for fit in fits_list}
+        return empty, dict(empty)
 
     # Резолв областей (§6.1) — один вызов на уникальную область.
     scope_ids_by_key: dict[tuple[str, int], set[int]] = {}
@@ -90,38 +110,54 @@ def _bottlenecks_by_fit(fits_list: list[Fit]) -> dict[int, list[int]]:
     for ids in scope_ids_by_key.values():
         location_union |= ids
 
-    # Пакетные выборки StockLevel: объёмы по типам и наличие агрегата по
-    # локации (§6.7 — проверка на уровне локации, не типа).
+    # Пакетная выборка объёмов: одна на все (type_id, location_id). Свежесть —
+    # один вызов на всё объединение локаций, без проверки на каждый фит/компонент.
     volume_by_key: dict[tuple[int, int], int] = {}
     for location_id, type_id, total in StockLevel.objects.filter(
         type_id__in=type_ids, location_id__in=location_union
     ).values_list("location_id", "type_id", "total_sell_volume"):
         volume_by_key[(location_id, type_id)] = total
-    present_locations = set(
-        StockLevel.objects.filter(location_id__in=location_union).values_list("location_id", flat=True).distinct()
-    )
+    settings_obj = PluginSetting.load()
+    fresh_locations, freshness_reasons = _freshness_details(location_union, settings_obj.data_stale_after_min)
+    reason_by_location = _freshness_reasons_by_location(freshness_reasons, location_union)
 
     bottlenecks: dict[int, list[int]] = {}
+    warnings_by_fit: dict[int, list[str]] = {}
     for fit in fits_list:
-        inputs: list[ComponentInput] = []
+        fit_location_ids: set[int] = set()
+        scope_rows: list[tuple[FitComponent, set[int]]] = []
         for component in comps_by_fit.get(fit.pk, []):
             scope = _fit_scope(fit, component)
             ids = scope_ids_by_key[scope]
-            availability = sum(volume_by_key.get((location_id, component.type_id), 0) for location_id in ids)
-            has_data = bool(ids) and ids <= present_locations
+            scope_rows.append((component, ids))
+            fit_location_ids |= ids
+        if any(not ids for _component, ids in scope_rows):
+            # Пустая область — NO_DATA (§6.4): узкие места и предупреждения
+            # о нулевом вкладе не имеют смысла.
+            bottlenecks[fit.pk] = []
+            warnings_by_fit[fit.pk] = []
+            continue
+        inputs: list[ComponentInput] = []
+        for component, ids in scope_rows:
+            usable_ids = ids & fresh_locations
+            availability = sum(volume_by_key.get((location_id, component.type_id), 0) for location_id in usable_ids)
             inputs.append(
                 ComponentInput(type_id=component.type_id, qty_per_fit=component.qty_per_fit, availability=availability)
             )
-            if not has_data:
-                # NO_DATA: узкие места по фиту не имеют смысла (§6.7).
-                inputs = []
-                break
-        if not inputs:
-            bottlenecks[fit.pk] = []
-            continue
         _k, bottleneck_indices = engine.calc_fits([c.availability for c in inputs], inputs)
         bottlenecks[fit.pk] = [inputs[i].type_id for i in bottleneck_indices]
-    return bottlenecks
+        warnings_by_fit[fit.pk] = [
+            _(
+                "Location %(location_id)s: %(reason)s; contribution 0; deficit and cost "
+                "are calculated from the other locations"
+            )
+            % {
+                "location_id": location_id,
+                "reason": reason_by_location.get(location_id, "no fresh StockLevel aggregate"),
+            }
+            for location_id in sorted(fit_location_ids - fresh_locations)
+        ]
+    return bottlenecks, warnings_by_fit
 
 
 @login_required
@@ -159,7 +195,7 @@ def index(request):
     fits = list(fits.order_by(sort_desc if reverse else sort_asc))
 
     # Узкие места по всем фитам сразу (массовые выборки, §22.4).
-    bottlenecks_by_fit = _bottlenecks_by_fit(fits)
+    bottlenecks_by_fit, warnings_by_fit = _bottlenecks_by_fit(fits)
     all_bottleneck_type_ids = {type_id for ids in bottlenecks_by_fit.values() for type_id in ids}
     type_names = dict(EveType.objects.filter(pk__in=all_bottleneck_type_ids).values_list("pk", "name"))
 
@@ -183,6 +219,7 @@ def index(request):
                 "ships_from_market": ships.ships_from_market,
                 "ships_total": ships.ships_total,
                 "ships_status": ships.ships_status,
+                "data_warnings": warnings_by_fit.get(fit.pk, []),
             }
         )
 
@@ -198,6 +235,8 @@ def index(request):
     no_data_count = sum(1 for fit in fits if fit.status_cache == FitStatus.NO_DATA)
     hull_missing_count = sum(1 for fit in fits if fit.status_cache == FitStatus.HULL_MISSING)
     # ΣC / ΣK / Σ(C+K) только для фитов, где оба значения известны (решение №41).
+    # Локация без данных даёт нулевой вклад в K, но не no_data (решение №45):
+    # такой фит остаётся в сводке, если C и K известны.
     known_ships = [ships for ships in ships_by_fit.values() if not ships.is_partial]
     ships_in_contracts_sum = sum(ships.ships_in_contracts or 0 for ships in known_ships)
     ships_from_market_sum = sum(ships.ships_from_market or 0 for ships in known_ships)

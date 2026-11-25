@@ -784,8 +784,8 @@ def test_cleanup_orphan_cache_removes_jita_when_disabled_or_deleted(settings_row
 
 @pytest.mark.django_db
 def test_sync_region_orders_triggers_recalc_and_stock_level(settings_row, jita_enabled):  # noqa: F811
-    """Цепочка §12.3: после sync_region_orders recalc_stock_levels получает location_ids=None
-    и StockLevel реально создаётся по локациям из свежего кэша."""
+    """Цепочка §12.3: sync_region_orders явно передаёт список локаций в recalc_stock_levels
+    (включая пустые), и StockLevel реально создаётся по локациям из свежего кэша (решение №46)."""
     with mock.patch.object(esi_client, "fetch_region_orders") as fetch:
         fetch.return_value = ([_order(type_id=34, price=7.0, volume=42)], False)
         result = tasks.sync_region_orders(trigger=TriggerKind.MANUAL)

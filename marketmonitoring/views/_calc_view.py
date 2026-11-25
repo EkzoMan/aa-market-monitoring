@@ -12,11 +12,28 @@ from decimal import Decimal
 
 from ..calc import engine
 from ..calc.engine import ComponentInput, OrderBookRow
-from ..calc.service import check_freshness, resolve_scope_ids
+from ..calc.service import _freshness_details, resolve_scope_ids
 from ..esi.selectors import is_jita_enabled
 from ..models import JitaOrderLevel, PluginSetting, StockLevel
 
 logger = logging.getLogger("marketmonitoring")
+
+
+def _diagnostic_reasons(
+    scope_ids: dict[tuple[str, int], set[int]],
+    present_locations: set[int],
+    freshness_reasons: list[str],
+) -> list[str]:
+    """Предупреждения с id локаций: пустая область, нет агрегата, не свежие данные (§6.7)."""
+    reasons = list(freshness_reasons)
+    for scope, ids in sorted(scope_ids.items()):
+        if not ids:
+            reasons.append(f"scope {scope[0]}/{scope[1]}: no locations resolved")
+            continue
+        missing = ids - present_locations
+        if missing:
+            reasons.append(f"scope {scope[0]}/{scope[1]}: no StockLevel aggregate for locations {sorted(missing)}")
+    return reasons
 
 
 def build_component_request_rows(requests) -> list[dict]:
@@ -25,12 +42,12 @@ def build_component_request_rows(requests) -> list[dict]:
     Один запрос настроек (PluginSetting.load), кеш резолва областей (§6.1),
     пакетные выборки StockLevel и JitaOrderLevel по всем типам; расчёт —
     чистые функции calc/engine (§22.3). Свежесть (§6.7) проверяется один раз
-    по объединению локаций всех областей — если хотя бы одна нужная локация
-    не свежа, все строки NO_DATA (дефицит/стоимость не считаются, §6.4).
-    Компоненты вне фитов: HULL_MISSING не применяется (§6.10).
+    по объединению локаций всех областей и используется только для предупреждений:
+    локация без данных даёт нулевой вклад, ``NO_DATA`` — только при пустой
+    области (решение №45). Компоненты вне фитов: HULL_MISSING не применяется (§6.10).
     Если Jita отключена, ценовые поля обнуляются чистой функцией engine.price_unavailable:
     дефицит и статус считаются по локальным рынкам, но cost становится None (не 0).
-    Возвращает список словарей: obj, type_id, status, deficit, cost.
+    Возвращает список словарей: obj, type_id, status, deficit, cost, reasons.
     """
     requests = list(requests)
     if not requests:
@@ -45,7 +62,7 @@ def build_component_request_rows(requests) -> list[dict]:
     for ids in scope_ids.values():
         location_union |= ids
 
-    fresh, _reasons = check_freshness(location_union, settings_obj.data_stale_after_min)
+    fresh_locations, freshness_reasons = _freshness_details(location_union, settings_obj.data_stale_after_min)
 
     # Две пакетные выборки StockLevel: объёмы по нужным типам и наличие
     # агрегата по локации (§6.7 — проверка на уровне локации, не типа).
@@ -57,6 +74,7 @@ def build_component_request_rows(requests) -> list[dict]:
     present_locations = set(
         StockLevel.objects.filter(location_id__in=location_union).values_list("location_id", flat=True).distinct()
     )
+    reasons = _diagnostic_reasons(scope_ids, present_locations, freshness_reasons)
 
     # packaged_volume (§6.9) — из SDE через eveuniverse, один запрос.
     from eveuniverse.models import EveType
@@ -81,27 +99,32 @@ def build_component_request_rows(requests) -> list[dict]:
 
     rows = []
     for request_obj in requests:
-        ids = scope_ids[(request_obj.scope_kind, request_obj.scope_ref)]
-        # Агрегат StockLevel должен быть по всем нужным локациям области (§6.7).
-        # Нет лотов нужного типа на свежей локации → A=0, но не NO_DATA.
-        has_data = bool(ids) and ids <= present_locations
-        if not fresh or not has_data:
+        scope = (request_obj.scope_kind, request_obj.scope_ref)
+        ids = scope_ids[scope]
+        has_no_data = not ids
+        usable_ids = ids & fresh_locations
+        component = ComponentInput(
+            type_id=request_obj.type_id,
+            qty_per_fit=1,  # компонент вне фитов: q=1 (§6.10)
+            availability=sum(volume_by_key.get((location_id, request_obj.type_id), 0) for location_id in usable_ids),
+            packaged_volume=packaged_volumes.get(request_obj.type_id, Decimal("0")),
+        )
+        if has_no_data:
+            # engine.calc_fit_status — единственное место выбора NO_DATA (§6.4).
+            status = engine.calc_fit_status(
+                True, component.availability, component.availability, request_obj.qty_target, allow_hull_missing=False
+            )
             rows.append(
                 {
                     "obj": request_obj,
                     "type_id": request_obj.type_id,
-                    "status": engine.STATUS_NO_DATA,
+                    "status": status,
                     "deficit": None,
                     "cost": None,
+                    "reasons": reasons,
                 }
             )
             continue
-        component = ComponentInput(
-            type_id=request_obj.type_id,
-            qty_per_fit=1,  # компонент вне фитов: q=1 (§6.10)
-            availability=sum(volume_by_key.get((location_id, request_obj.type_id), 0) for location_id in ids),
-            packaged_volume=packaged_volumes.get(request_obj.type_id, Decimal("0")),
-        )
         result = engine.calc_component(
             component=component,
             qty_target=request_obj.qty_target,
@@ -124,6 +147,7 @@ def build_component_request_rows(requests) -> list[dict]:
                 "status": status,
                 "deficit": result.deficit,
                 "cost": result.cost,
+                "reasons": reasons,
             }
         )
     return rows
@@ -133,8 +157,9 @@ class FitComponentRows:
     """Данные расчёта позиций одного фита для UI (fit_detail, exports).
 
     Общая оркестрация чтения кэша БД (§22.4): компоненты фита, примитивы
-    ComponentInput, результаты engine.calc_component, флаги NO_DATA по позициям
-    (§6.4, §6.7), имена типов. Формулы остаются в calc/engine (§22.3).
+    ComponentInput, результаты engine.calc_component, флаги NO_DATA по пустой
+    области (§6.4, §6.7), предупреждения о локациях без данных и имена типов.
+    Формулы остаются в calc/engine (§22.3).
     """
 
     def __init__(
@@ -154,17 +179,23 @@ class FitComponentRows:
         # Цены Jita доступны только при включённой локации; при False карточка
         # фита не должна показывать сохранённый Fit.total_cost (stale-цена).
         self.jita_price_available = jita_price_available
-        # Флаг NO_DATA по каждой позиции: протухшие данные (§6.7), пустая
-        # область или отсутствие агрегата StockLevel по нужной локации (§6.7).
+        # NO_DATA только при пустой области позиции (§6.4, решение №45).
         self.component_no_data = component_no_data
+        # fresh/reasons — диагностика: локация без данных даёт вклад 0, но не
+        # меняет статус. UI показывает эти причины отдельным предупреждением.
         self.fresh = fresh
         self.reasons = reasons
         self.type_names = type_names
 
     @property
     def any_no_data(self) -> bool:
-        """Хотя бы одна позиция NO_DATA — дефицит/стоимость не считаются (§6.4)."""
-        return not self.fresh or any(self.component_no_data)
+        """Хотя бы одна позиция с пустой областью: NO_DATA (§6.4, решение №45)."""
+        return any(self.component_no_data)
+
+    @property
+    def has_data_warnings(self) -> bool:
+        """Есть предупреждения о локациях без свежих данных (§6.7)."""
+        return bool(self.reasons)
 
 
 def build_fit_component_rows(fit) -> FitComponentRows:
@@ -172,10 +203,11 @@ def build_fit_component_rows(fit) -> FitComponentRows:
 
     Чтение кэша БД плагина (StockLevel / JitaOrderLevel) пакетными запросами
     (без N+1, §22.4) + чистые функции calc/engine. UI к ESI не обращается (§5.10).
-    Позиция считается NO_DATA, если данные не свежи (§6.7), область пуста или
-    агрегат StockLevel отсутствует хотя бы по одной нужной локации (§6.7).
-    При выключенной Jita ценовые поля обнуляются чистой функцией
-    engine.price_unavailable: K/D_i и статус остаются, цены — None.
+    Позиция NO_DATA только при пустой области (§6.4, решение №45). Локации без
+    свежих данных (failed/partial/no_provider/stale/нет агрегата) дают вклад 0
+    и отдельное предупреждение с id локации (§6.7). При выключенной Jita ценовые
+    поля обнуляются чистой функцией engine.price_unavailable: K/D_i и статус
+    остаются, цены — None.
     """
     from eveuniverse.models import EveType
 
@@ -203,17 +235,17 @@ def build_fit_component_rows(fit) -> FitComponentRows:
     for ids in scope_ids.values():
         location_union |= ids
 
-    fresh, reasons = check_freshness(location_union, settings_obj.data_stale_after_min)
+    fresh_locations, freshness_reasons = _freshness_details(location_union, settings_obj.data_stale_after_min)
     volume_by_key: dict[tuple[int, int], int] = {}
     for location_id, type_id, total in StockLevel.objects.filter(
         type_id__in=type_ids, location_id__in=location_union
     ).values_list("location_id", "type_id", "total_sell_volume"):
         volume_by_key[(location_id, type_id)] = total
-    # §6.7: NO_DATA только если у локации нет агрегата StockLevel вообще;
-    # отсутствие лотов конкретного типа даёт A=0, а не NO_DATA.
     present_locations = set(
         StockLevel.objects.filter(location_id__in=location_union).values_list("location_id", flat=True).distinct()
     )
+    reasons = _diagnostic_reasons(scope_ids, present_locations, freshness_reasons)
+    fresh = not freshness_reasons
 
     # Один запрос стакана Jita по всем типам (§22.4), rank=1 — минимальная цена.
     # Gate по включённости локации: отключённая Jita не даёт stale-цен из кэша.
@@ -231,9 +263,10 @@ def build_fit_component_rows(fit) -> FitComponentRows:
         ComponentInput(
             type_id=component.type_id,
             qty_per_fit=component.qty_per_fit,
+            # Локация без свежих данных не даёт объём (§6.2, решение №45).
             availability=sum(
                 volume_by_key.get((location_id, component.type_id), 0)
-                for location_id in scope_ids[_scope_of(component)]
+                for location_id in scope_ids[_scope_of(component)] & fresh_locations
             ),
             packaged_volume=packaged_volumes.get(component.type_id, Decimal("0")),
             is_hull=component.type_id == fit.hull_type_id,
@@ -254,10 +287,7 @@ def build_fit_component_rows(fit) -> FitComponentRows:
     ]
     if not jita_price_available:
         calc_results = [engine.price_unavailable(result) for result in calc_results]
-    component_no_data = [
-        not scope_ids[_scope_of(component)] or not scope_ids[_scope_of(component)] <= present_locations
-        for component in components
-    ]
+    component_no_data = [not scope_ids[_scope_of(component)] for component in components]
     return FitComponentRows(
         components=components,
         component_inputs=component_inputs,

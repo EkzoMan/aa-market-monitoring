@@ -169,7 +169,17 @@
       <tbody>
         {% for row in rows %}
         <tr>
-          <td class="mm-nowrap"><a href="{% url 'marketmonitoring:fit_detail' row.fit.pk %}">{{ row.fit.name }}</a></td>
+          <td>
+            <span class="mm-nowrap"><a href="{% url 'marketmonitoring:fit_detail' row.fit.pk %}">{{ row.fit.name }}</a></span>
+            {# Локация без данных — жёлтое предупреждение внутри строки таблицы; чип статуса фита не меняется (№45). #}
+            {% if row.data_warnings %}
+            <div class="alert alert-warning py-0 px-1 mt-1 mb-0 small" role="alert">
+              <i class="fas fa-triangle-exclamation me-1" aria-hidden="true"></i>
+              {% for warning in row.data_warnings %}<div>{{ warning }}</div>{% endfor %}
+              {% if can_edit %}<a href="{% url 'marketmonitoring:locations' %}">{% translate "Locations" %}</a>{% endif %}
+            </div>
+            {% endif %}
+          </td>
           {# Collectability = C+K: число и прогресс из сводки кораблей, а не из рыночного K. При no_data — «—» без прогресса (решение №43). #}
           <td>
             {% if row.ships_total is not None %}

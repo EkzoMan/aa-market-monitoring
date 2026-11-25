@@ -13,7 +13,7 @@ from django.urls import reverse
 from django.utils.translation import gettext as _
 
 from ..auth_hooks import has_edit, has_view
-from ..constants import FitStatus, ScopeKind
+from ..constants import ScopeKind
 from ..eft.parser import parse_eft
 from ..forms import FitComponentRowForm, FitForm
 from ..models import Fit, FitComponent
@@ -426,17 +426,14 @@ def fit_detail(request, fit_id: int):
     components = data.components
 
     # Строки компонентов §14.1: доступность, дефицит, unit, ref, стоимость, бейджи.
-    # Единое поведение с recalc_fit (calc/service): пустая область или отсутствие
-    # агрегата StockLevel хотя бы по одной позиции — NO_DATA (§6.4, §6.7).
-    no_data = not data.fresh or any(data.component_no_data)
+    # NO_DATA только при пустой области позиции (§6.4, решение №45). Локации без
+    # данных дают нулевой вклад и показываются отдельным предупреждением (§6.7).
+    no_data = any(data.component_no_data)
     k, bottleneck_indices = engine.calc_fits([c.availability for c in data.component_inputs], data.component_inputs)
 
-    # Статус фита (§6.4): NO_DATA > HULL_MISSING > DEFICIT > OK.
+    # Статус фита (§6.4): calc_fit_status — единственное место выбора NO_DATA.
     hull_available = next((c.availability for c in data.component_inputs if c.is_hull), 0)
-    if no_data:
-        status = FitStatus.NO_DATA
-    else:
-        status = engine.calc_fit_status(False, hull_available, k, fit.qty_target, allow_hull_missing=True)
+    status = engine.calc_fit_status(no_data, hull_available, k, fit.qty_target, allow_hull_missing=True)
 
     def _scope_of(component: FitComponent) -> tuple[str, int]:
         """Эффективная область позиции: override компонента, иначе область фита (§6.3)."""
@@ -469,23 +466,23 @@ def fit_detail(request, fit_id: int):
                     _scope_of(component), f"{_scope_of(component)[0]} {_scope_of(component)[1]}"
                 ),
                 "required": fit.qty_target * component.qty_per_fit,
-                "available": component_input.availability,
-                "deficit": calc_result.deficit,
-                "unit": calc_result.unit,
-                "ref": calc_result.ref,
-                "cost": calc_result.cost,
-                "is_not_covered": calc_result.is_not_covered,
-                "shortfall": calc_result.shortfall,
-                "is_overprice": calc_result.is_overprice,
-                "overprice_pct": calc_result.overprice_pct,
+                "available": None if no_data else component_input.availability,
+                "deficit": None if no_data else calc_result.deficit,
+                "unit": None if no_data else calc_result.unit,
+                "ref": None if no_data else calc_result.ref,
+                "cost": None if no_data else calc_result.cost,
+                "is_not_covered": False if no_data else calc_result.is_not_covered,
+                "shortfall": None if no_data else calc_result.shortfall,
+                "is_overprice": False if no_data else calc_result.is_overprice,
+                "overprice_pct": None if no_data else calc_result.overprice_pct,
                 "is_hull": component.type_id == fit.hull_type_id,
                 "no_data": row_no_data,
                 "is_bottleneck": component.type_id in {data.component_inputs[j].type_id for j in bottleneck_indices},
             }
         )
 
-    # Отключённая Jita: цена докупки недоступна — None, не stale и не сумма нулей.
-    if not data.jita_price_available:
+    # NO_DATA/отключённая Jita: цена докупки недоступна — None, не stale и не сумма нулей.
+    if no_data or not data.jita_price_available:
         display_total = None
     elif fit.status_cache == status:
         display_total = fit.total_cost
@@ -519,7 +516,10 @@ def fit_detail(request, fit_id: int):
         "status": status,
         "k": None if no_data else k,
         "total_cost": display_total,
-        "reasons": data.reasons if no_data else [],
+        # Причины локаций без данных показываются и при DEFICIT/OK/HULL_MISSING:
+        # они не меняют статус фита (§6.7, решение №45).
+        "reasons": data.reasons,
+        "data_warnings": data.has_data_warnings and not no_data,
         "rows": rows,
         # Счётчики шапки (02-fit-detail.md): оверпрайс-позиции и строки с дефицитом.
         "overprice_count": (fit.overprice_count or 0) if data.jita_price_available else 0,

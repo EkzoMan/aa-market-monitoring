@@ -13,7 +13,7 @@ from django.utils import timezone
 from marketmonitoring.calc import engine
 from marketmonitoring.calc import service as calc_service
 from marketmonitoring.calc.engine import ComponentInput, OrderBookRow
-from marketmonitoring.constants import FitStatus, LocationKind, ScopeKind, SyncStatus
+from marketmonitoring.constants import FitStatus, LocationKind, ScopeKind, ShipsStatus, SyncStatus
 from marketmonitoring.models import (
     ComponentRequest,
     Fit,
@@ -459,34 +459,36 @@ def test_service_reference_full(sde_ids):
     assert result.components[2].deficit == 20000
 
 
-def test_service_no_data_missing_stock(sde_ids):
-    """NO_DATA при отсутствии агрегата StockLevel по нужной локации (§18.4, §6.7)."""
+def test_service_missing_stock_zero_availability(sde_ids):
+    """Нет агрегата StockLevel → вклад локации 0, HULL_MISSING, а не NO_DATA (§19.21)."""
     fit = _fit_with_components()
     _add_stock(60003760, 1, 10)
     _add_stock(60003760, 2, 100)
     # У локации нет ни одного агрегата — данные по ней не синкались.
     StockLevel.objects.filter(location_id=60003760).delete()
     _add_jita_levels(1, [("40000000", 5)])
-    calc_service.recalc_fit(fit)
+    result = calc_service.recalc_fit(fit)
     fit.refresh_from_db()
-    assert fit.status_cache == FitStatus.NO_DATA
-    assert fit.fits_available is None and fit.total_cost is None
+    assert fit.status_cache == FitStatus.HULL_MISSING
+    assert fit.fits_available == 0
+    assert any("60003760" in reason for reason in result.reasons)
 
 
-def test_service_no_data_stale(sde_ids):
-    """NO_DATA при протухших данных last_synced_at (§18.4, §6.7)."""
+def test_service_stale_data_zero_availability(sde_ids):
+    """Протухший last_synced_at → вклад локации 0, HULL_MISSING, а не NO_DATA (§19.21)."""
     fit = _fit_with_components()
     _add_stock(60003760, 1, 10)
     _add_stock(60003760, 2, 100)
     _add_stock(60003760, 3, 10000)
     MarketLocation.objects.filter(station_id=60003760).update(last_synced_at=timezone.now() - timedelta(minutes=600))
-    calc_service.recalc_fit(fit)
+    result = calc_service.recalc_fit(fit)
     fit.refresh_from_db()
-    assert fit.status_cache == FitStatus.NO_DATA
+    assert fit.status_cache == FitStatus.HULL_MISSING
+    assert any("60003760" in reason and "stale" in reason for reason in result.reasons)
 
 
-def test_service_no_data_structure_bad_sync(sde_ids):
-    """NO_DATA, если структура области имеет sync_status != ok (§6.7)."""
+def test_service_structure_bad_sync_zero_availability(sde_ids):
+    """no_provider у структуры → её вклад 0, фит считается по другим локациям (§19.21)."""
     fit = _make_fit(n=5, scope_kind=ScopeKind.SYSTEM, scope_ref=30000142)
     FitComponent.objects.create(fit=fit, type_id=1, qty_per_fit=1)
     _make_location_fresh(60003760)
@@ -494,9 +496,11 @@ def test_service_no_data_structure_bad_sync(sde_ids):
     MarketLocation.objects.filter(structure_id=70000001).update(sync_status=SyncStatus.NO_PROVIDER)
     _add_stock(60003760, 1, 10)
     _add_stock(70000001, 1, 50)
-    calc_service.recalc_fit(fit)
+    result = calc_service.recalc_fit(fit)
     fit.refresh_from_db()
-    assert fit.status_cache == FitStatus.NO_DATA
+    assert fit.status_cache == FitStatus.OK
+    assert fit.fits_available == 10
+    assert any("structure 70000001" in reason for reason in result.reasons)
 
 
 def test_service_hull_missing(sde_ids):
@@ -570,10 +574,12 @@ def test_component_request_calc(sde_ids):
     result = calc_service.recalc_component_request(request)
     assert result.status == FitStatus.OK
 
-    # Нет данных вообще → NO_DATA (HULL_MISSING не применяется)
+    # Нет данных вообще → A=0 и DEFICIT; NO_DATA только при пустой области (§19.21).
     StockLevel.objects.filter(type_id=9).delete()
     result = calc_service.recalc_component_request(request)
-    assert result.status == FitStatus.NO_DATA
+    assert result.status == FitStatus.DEFICIT
+    assert result.k == 0 and result.components[0].deficit == 10
+    assert any("60003760" in reason for reason in result.reasons)
 
 
 def test_recalc_via_task(sde_ids):
@@ -598,11 +604,11 @@ def test_recalc_via_task(sde_ids):
 # ---------------------------------------------------------------------------
 
 
-def test_no_data_stale_region_for_npc_station_without_market_location(sde_ids):
+def test_stale_region_for_npc_station_without_market_location(sde_ids):
     """M1: NPC-станция без записи MarketLocation проверяется регионально (§6.7).
 
     Регион станции резолвится через eveuniverse (EveStation -> EveRegion);
-    протухшие данные региона → NO_DATA, свежие → расчёт выполняется.
+    протухшие данные региона дают нулевой вклад, свежие → обычный расчёт.
     """
     fit = _make_fit(n=5, scope_kind=ScopeKind.REGION, scope_ref=10000002)
     FitComponent.objects.create(fit=fit, type_id=1, qty_per_fit=1)
@@ -615,8 +621,8 @@ def test_no_data_stale_region_for_npc_station_without_market_location(sde_ids):
 
     result = calc_service.recalc_fit(fit)
     fit.refresh_from_db()
-    assert fit.status_cache == FitStatus.NO_DATA
-    assert fit.fits_available is None
+    assert fit.status_cache == FitStatus.HULL_MISSING
+    assert fit.fits_available == 0
     assert any("region 10000002" in reason for reason in result.reasons)
 
     # Свежие данные регионального синка → расчёт выполняется.
@@ -629,8 +635,8 @@ def test_no_data_stale_region_for_npc_station_without_market_location(sde_ids):
     assert result.reasons == []
 
 
-def test_no_data_when_aggregate_missing_at_one_location(sde_ids):
-    """M2: NO_DATA, если агрегат StockLevel отсутствует у одной локации области (§6.7)."""
+def test_missing_aggregate_at_one_location_contributes_zero(sde_ids):
+    """M2: отсутствие агрегата у локации даёт вклад 0, но не NO_DATA (§19.21)."""
     fit = _make_fit(n=5, scope_kind=ScopeKind.SYSTEM, scope_ref=30000142)
     FitComponent.objects.create(fit=fit, type_id=1, qty_per_fit=1)
     _make_location_fresh(60003760)
@@ -639,14 +645,14 @@ def test_no_data_when_aggregate_missing_at_one_location(sde_ids):
     _add_stock(60003760, 1, 10)
     _add_jita_levels(1, [("40000000", 10)])
 
-    availability, has_data = calc_service.get_availability(1, ScopeKind.SYSTEM, 30000142)
+    availability, scope_resolved = calc_service.get_availability(1, ScopeKind.SYSTEM, 30000142)
     assert availability == 10
-    assert not has_data
+    assert scope_resolved  # область непуста — это не NO_DATA
 
     result = calc_service.recalc_fit(fit)
     fit.refresh_from_db()
-    assert fit.status_cache == FitStatus.NO_DATA
-    assert fit.fits_available is None and fit.total_cost is None
+    assert fit.status_cache == FitStatus.OK
+    assert fit.fits_available == 10
     assert any("no StockLevel aggregate" in reason for reason in result.reasons)
 
 
@@ -681,15 +687,258 @@ def test_new_structure_without_type_orders_does_not_void_all_fits(sde_ids):
     assert result.reasons == []
 
 
+def test_new_npc_station_record_without_sync_timestamp_keeps_fresh_fit(sde_ids):
+    """Регресс: добавление уже синхронизированной NPC-станции не даёт NO_DATA (§6.7).
+
+    Locations UI создаёт запись станции со ``sync_status=stale`` и пустым
+    ``last_synced_at``. Для NPC-станции свежесть определяет региональный
+    ``StockLevel``; пустой ``last_synced_at`` не означает «устарело».
+    """
+    fit = _make_fit(n=5, scope_kind=ScopeKind.STATION, scope_ref=60003760)
+    FitComponent.objects.create(fit=fit, type_id=1, qty_per_fit=1)
+    _add_stock(60003760, 1, 10)
+    assert calc_service.recalc_fit(fit).status == FitStatus.OK
+
+    MarketLocation.objects.create(
+        name="Jita IV-4",
+        kind=LocationKind.STATION,
+        station_id=60003760,
+        solar_system_id=30000142,
+        region_id=10000002,
+        sync_status=SyncStatus.STALE,
+        last_synced_at=None,
+    )
+    fresh, reasons = calc_service.check_freshness({60003760}, 180)
+    assert fresh, reasons
+
+    result = calc_service.recalc_fit(fit)
+    fit.refresh_from_db()
+    assert result.status == FitStatus.OK, result.reasons
+    assert result.k == 10 and fit.fits_available == 10
+    assert result.reasons == []
+    assert fit.status_cache == FitStatus.OK
+    assert result.ships_availability.ships_from_market == 10
+    # Источник контрактов не настроен — общий C+K остаётся no_data (§6.13, решение №43).
+    assert fit.ships_status_cache == ShipsStatus.NO_DATA
+
+
+def test_additional_locations_do_not_void_station_scope(sde_ids):
+    """Регресс: station scope остаётся строгой одной локацией (§5.1, решение №12).
+
+    Дополнительно воспроизводится исходный баг: запись самой станции фита
+    создана Locations UI со ``sync_status=stale`` и пустым ``last_synced_at``.
+    """
+    fit = _make_fit(n=5, scope_kind=ScopeKind.STATION, scope_ref=60003760)
+    FitComponent.objects.create(fit=fit, type_id=1, qty_per_fit=1)
+    _make_location_fresh(60003760)
+    _add_stock(60003760, 1, 10)
+    # Locations UI: новая запись NPC-станции без timestamps — не NO_DATA.
+    MarketLocation.objects.filter(station_id=60003760).update(sync_status=SyncStatus.STALE, last_synced_at=None)
+    assert calc_service.recalc_fit(fit).status == FitStatus.OK
+
+    # Дополнительная станция и включённая структура той же системы не входят в L(S).
+    MarketLocation.objects.create(
+        name="Other station",
+        kind=LocationKind.STATION,
+        station_id=60003761,
+        solar_system_id=30000142,
+        region_id=10000002,
+        sync_status=SyncStatus.STALE,
+        last_synced_at=None,
+    )
+    _make_location_fresh(70000001, kind=LocationKind.STRUCTURE, synced=False)
+    MarketLocation.objects.filter(structure_id=70000001).update(sync_status=SyncStatus.STALE)
+    # Объёмы на посторонних локациях не должны попасть в A и K фита.
+    _add_stock(60003761, 1, 500)
+    _add_stock(70000001, 1, 500)
+
+    assert calc_service.resolve_scope_ids(ScopeKind.STATION, 60003760) == {60003760}
+    availability, has_data = calc_service.get_availability(1, ScopeKind.STATION, 60003760)
+    assert has_data and availability == 10
+    result = calc_service.recalc_fit(fit)
+    fit.refresh_from_db()
+    assert result.status == FitStatus.OK, result.reasons
+    assert result.k == 10 and fit.fits_available == 10
+
+
+def test_new_structure_without_any_stock_contributes_zero(sde_ids):
+    """Регресс: структура без единого агрегата StockLevel даёт вклад 0, не NO_DATA (§19.21).
+
+    Остальные локации системы продолжают определять статус фита; id структуры
+    попадает в предупреждение, но дефицит/стоимость считаются общим правилом.
+    """
+    fit = _make_fit(n=5, scope_kind=ScopeKind.SYSTEM, scope_ref=30000142)
+    FitComponent.objects.create(fit=fit, type_id=1, qty_per_fit=1)
+    _make_location_fresh(60003760)
+    _make_location_fresh(60003761)
+    _add_stock(60003760, 1, 10)
+    _add_stock(60003761, 1, 10)
+    assert calc_service.recalc_fit(fit).status == FitStatus.OK
+
+    _make_location_fresh(70000001, kind=LocationKind.STRUCTURE)
+    result = calc_service.recalc_fit(fit)
+    assert result.status == FitStatus.OK, result.reasons
+    assert result.k == 20 and fit.fits_available == 20
+    assert any("70000001" in reason for reason in result.reasons)
+
+    # Нулевой агрегат по нужному типу тоже даёт вклад 0 и убирает предупреждение.
+    _add_stock(70000001, 1, 0)
+    result = calc_service.recalc_fit(fit)
+    assert result.status == FitStatus.OK, result.reasons
+    assert result.k == 20 and result.reasons == []
+
+
+def test_stale_npc_station_timestamp_zero_availability(sde_ids):
+    """Протухший last_synced_at NPC-станции даёт вклад 0, но не NO_DATA (§19.21).
+
+    Причина содержит id станции; ``check_freshness`` остаётся диагностикой,
+    статус фита выбирается ``engine.calc_fit_status`` по нулевому вкладу.
+    """
+    fit = _make_fit(n=5, scope_kind=ScopeKind.STATION, scope_ref=60003760)
+    FitComponent.objects.create(fit=fit, type_id=1, qty_per_fit=1)
+    _make_location_fresh(60003760)
+    _add_stock(60003760, 1, 10)  # updated_at свежий: региональный кэш в порядке
+    MarketLocation.objects.filter(station_id=60003760).update(
+        sync_status=SyncStatus.OK, last_synced_at=timezone.now() - timedelta(minutes=600)
+    )
+
+    fresh, reasons = calc_service.check_freshness({60003760}, 180)
+    assert not fresh
+    assert any("60003760" in reason and "stale" in reason for reason in reasons)
+    assert not any("region" in reason for reason in reasons)
+
+    result = calc_service.recalc_fit(fit)
+    fit.refresh_from_db()
+    assert result.status == FitStatus.HULL_MISSING, result.reasons
+    assert result.k == 0 and fit.fits_available == 0
+    assert fit.status_cache == FitStatus.HULL_MISSING
+    assert fit.ships_status_cache == ShipsStatus.NO_DATA  # контракты не настроены — C+K неполный
+    assert result.ships_availability.is_partial is True
+    assert any("60003760" in reason and "stale" in reason for reason in result.reasons)
+
+
+@pytest.mark.parametrize("bad_status", [SyncStatus.NO_ACL, SyncStatus.ERROR, SyncStatus.NO_PROVIDER, SyncStatus.STALE])
+def test_structure_bad_sync_status_zero_availability(sde_ids, bad_status):
+    """Структура с sync_status != ok даёт вклад 0, не NO_DATA (§19.21)."""
+    fit = _make_fit(n=5, scope_kind=ScopeKind.SYSTEM, scope_ref=30000142)
+    FitComponent.objects.create(fit=fit, type_id=1, qty_per_fit=1)
+    _make_location_fresh(60003760)
+    _make_location_fresh(60003761)
+    _make_location_fresh(70000001, kind=LocationKind.STRUCTURE)
+    MarketLocation.objects.filter(structure_id=70000001).update(sync_status=bad_status)
+    _add_stock(60003760, 1, 10)
+    _add_stock(60003761, 1, 10)
+    _add_stock(70000001, 1, 10)
+
+    fresh, reasons = calc_service.check_freshness({60003760, 60003761, 70000001}, 180)
+    assert not fresh
+    assert any("structure 70000001" in reason and bad_status in reason for reason in reasons)
+    assert not any("60003760" in reason or "60003761" in reason for reason in reasons)
+
+    result = calc_service.recalc_fit(fit)
+    fit.refresh_from_db()
+    assert result.status == FitStatus.OK, result.reasons
+    assert result.k == 20 and fit.fits_available == 20  # структура не участвует в A
+    assert fit.status_cache == FitStatus.OK
+    assert any("structure 70000001" in reason for reason in result.reasons)
+
+
+def test_component_inputs_reports_missing_location_ids_with_one_aggregate_query(sde_ids, monkeypatch):
+    """Один запрос агрегатов на все компоненты; предупреждения содержат id локаций (§22.4, §6.7)."""
+    fit = _make_fit(n=5, scope_kind=ScopeKind.SYSTEM, scope_ref=30000142)
+    for type_id in (1, 2, 3):
+        FitComponent.objects.create(fit=fit, type_id=type_id, qty_per_fit=1)
+    FitComponent.objects.filter(type_id=3).update(scope_override_kind=ScopeKind.STATION, scope_override_ref=60003760)
+    _make_location_fresh(60003760)
+    _make_location_fresh(60003761)
+    # Агрегат есть только на 60003760; system-область компонентов 1 и 2 требует ещё 60003761.
+    _add_stock(60003760, 1, 10)
+
+    original = calc_service.locations_with_stock
+    calls = []
+
+    def counting_locations_with_stock(location_ids):
+        calls.append(set(location_ids))
+        return original(location_ids)
+
+    monkeypatch.setattr(calc_service, "locations_with_stock", counting_locations_with_stock)
+    rows, all_scopes_resolved, missing = calc_service._component_inputs(fit, {})
+
+    assert len(rows) == 3
+    assert all_scopes_resolved is True  # области непусты: отсутствие данных ≠ NO_DATA
+    assert len(calls) == 1
+    assert calls[0] == {60003760, 60003761}
+    assert missing == {(ScopeKind.SYSTEM, 30000142): {60003761}}
+
+    result = calc_service.recalc_fit(fit)
+    assert result.status == FitStatus.DEFICIT  # A=0 по непокрытым локациям, статус по общему правилу
+    assert any("60003761" in reason for reason in result.reasons)
+    assert any("scope system/30000142" in reason for reason in result.reasons)
+
+
+def test_component_inputs_reuses_resolved_scope_ids_without_n_plus_one(sde_ids, monkeypatch):
+    """Один резолв области на все компоненты: get_availability не перерезолвит (§22.4)."""
+    fit = _make_fit(n=5, scope_kind=ScopeKind.STATION, scope_ref=60003760)
+    for type_id in (1, 2, 3):
+        FitComponent.objects.create(fit=fit, type_id=type_id, qty_per_fit=1)
+    _make_location_fresh(60003760)
+    for type_id in (1, 2, 3):
+        _add_stock(60003760, type_id, 10)
+
+    original_resolve = calc_service.resolve_scope_ids
+    resolve_calls = []
+
+    def counting_resolve(scope_kind, scope_ref):
+        resolve_calls.append((scope_kind, scope_ref))
+        return original_resolve(scope_kind, scope_ref)
+
+    monkeypatch.setattr(calc_service, "resolve_scope_ids", counting_resolve)
+
+    rows, all_data, missing = calc_service._component_inputs(fit, {})
+
+    assert len(rows) == 3
+    assert all_data is True
+    assert missing == {}
+    assert resolve_calls == [(ScopeKind.STATION, 60003760)]
+
+
+def test_empty_scope_reports_no_locations_resolved(sde_ids):
+    """Пустая область — NO_DATA с объяснением в reasons (§6.4, §18.4)."""
+    from eveuniverse.models import EveConstellation, EveSolarSystem
+
+    empty_system = EveSolarSystem.objects.create(
+        id=30000144,
+        name="Empty system",
+        eve_constellation=EveConstellation.objects.get(id=20000001),
+        security_status=0.9,
+    )
+    fit = _make_fit(n=5, scope_kind=ScopeKind.SYSTEM, scope_ref=empty_system.id)
+    FitComponent.objects.create(fit=fit, type_id=1, qty_per_fit=1)
+
+    assert calc_service.resolve_scope_ids(ScopeKind.SYSTEM, empty_system.id) == set()
+    availability, has_data = calc_service.get_availability(1, ScopeKind.SYSTEM, empty_system.id)
+    assert availability == 0 and has_data is False
+
+    result = calc_service.recalc_fit(fit)
+    fit.refresh_from_db()
+    assert result.status == FitStatus.NO_DATA
+    assert fit.status_cache == FitStatus.NO_DATA and fit.fits_available is None
+    assert result.k is None and result.total_cost is None
+    assert any(
+        f"scope {ScopeKind.SYSTEM}/{empty_system.id}: no locations resolved" in reason for reason in result.reasons
+    )
+
+
 def test_regional_check_not_applied_to_structures(sde_ids):
     """m2: региональная проверка свежести — только NPC-станции, не структуры (§6.7).
 
     Структура свежа по last_synced_at/sync_status структурного синка; отсутствие
-    региональных данных не делает её NO_DATA.
+    региональных данных не порождает предупреждение по структуре.
     """
     _make_location_fresh(60003760)
     _make_location_fresh(70000001, kind=LocationKind.STRUCTURE)
     _add_stock(60003760, 1, 10)
+    _add_stock(70000001, 1, 10)
 
     # Структура + свежая NPC-станция со свежими региональными данными → fresh.
     fresh, reasons = calc_service.check_freshness({60003760, 70000001}, 180)
@@ -697,7 +946,7 @@ def test_regional_check_not_applied_to_structures(sde_ids):
 
     # Протухшая региональная станция → причина только по станции, не по структуре.
     MarketLocation.objects.filter(station_id=60003760).update(last_synced_at=timezone.now() - timedelta(minutes=600))
-    StockLevel.objects.update(updated_at=timezone.now() - timedelta(minutes=600))
+    StockLevel.objects.filter(location_id=60003760).update(updated_at=timezone.now() - timedelta(minutes=600))
     fresh, reasons = calc_service.check_freshness({60003760, 70000001}, 180)
     assert not fresh
     assert any("60003760" in reason for reason in reasons)
@@ -724,11 +973,12 @@ def test_region_sync_freshness_uses_needed_locations_only(sde_ids):
     # Нужная станция 60003760 имеет свежие данные → NO_DATA нет.
     assert fit.status_cache == FitStatus.OK
 
-    # Убираем свежие данные нужной станции → региональная проверка ловит.
+    # Убираем свежие данные нужной станции → её вклад 0, регион в предупреждении.
     StockLevel.objects.filter(location_id=60003760).delete()
     result = calc_service.recalc_fit(fit)
     fit.refresh_from_db()
-    assert fit.status_cache == FitStatus.NO_DATA
+    assert fit.status_cache == FitStatus.HULL_MISSING  # A=0 (вторая станция даёт объём 0)
+    assert result.k == 0
     assert any("region 10000002" in reason for reason in result.reasons)
 
 

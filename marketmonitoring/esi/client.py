@@ -41,7 +41,7 @@ SCOPE_CHAR_CONTRACTS = "esi-contracts.read_character_contracts.v1"
 # GET /corporations/{id}/structures/, beat раз в сутки, MarketLocation(kind=structure,
 # enabled=false) с ручным включением и ACL §11. В тексте ТЗ указан несуществующий
 # идентификатор scope; в коде используется фактический scope из официальной спекы ESI
-# (https://esi.evetech.net/meta/openapi.json). ТЗ не редактируется.
+# (https://esi.evetech.net/meta/openapi.json). Опечатка в ТЗ не исправлялась.
 SCOPE_CORP_STRUCTURES = "esi-corporations.read_structures.v1"
 
 # Порог заголовка X-ESI-Error-Limit-Remain (§9.2).

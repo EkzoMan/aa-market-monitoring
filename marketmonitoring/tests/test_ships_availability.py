@@ -489,43 +489,185 @@ def test_no_data_source_excluded_from_summary_and_shown_as_dash(viewer_client, s
     assert "&mdash;" in detail_response.content.decode("utf-8")
 
 
-def test_market_no_data_excluded_from_summary_and_shown_as_dash(viewer_client, sde_ids):  # noqa: F811
-    """NO_DATA в рыночной части: контракты известны, но C+K и стоимость не считаются."""
+def test_missing_market_data_counts_zero_and_included_in_summary(viewer_client, sde_ids):  # noqa: F811
+    """Нет StockLevel → A=0; дефицит/стоимость/C+K считаются общим правилом (§19.21)."""
     fit = _seed_reference_market(sde_ids, name="No market data")
     _seed_full_kit_contracts(fit, 7)
-    # Нет агрегатов StockLevel по локации — рыночная часть NO_DATA (§6.7).
+    # Нет агрегатов StockLevel по локации — её вклад в A равен 0, не NO_DATA.
     StockLevel.objects.all().delete()
 
     result = calc_service.recalc_fit(fit)
     fit.refresh_from_db()
 
     ships = result.ships_availability
-    assert result.status == FitStatus.NO_DATA
-    assert result.k is None
-    assert result.total_cost is None
+    assert result.status == FitStatus.HULL_MISSING
+    assert result.k == 0
+    assert result.total_cost is not None
     assert ships.ships_in_contracts == 7
-    assert ships.ships_from_market is None
-    assert ships.ships_total is None
-    assert ships.ships_deficit is None
-    assert ships.ships_status == ShipsStatus.NO_DATA
-    assert ships.is_partial is True
-    assert fit.status_cache == FitStatus.NO_DATA
+    assert ships.ships_from_market == 0
+    assert ships.ships_total == 7
+    assert ships.ships_deficit == 23
+    assert ships.ships_status == ShipsStatus.DEFICIT
+    assert ships.is_partial is False
+    assert fit.status_cache == FitStatus.HULL_MISSING
     assert fit.contracts_status_cache == ContractFitStatus.DEFICIT
-    assert fit.total_cost is None
-    assert fit.ships_status_cache == ShipsStatus.NO_DATA
+    assert fit.ships_status_cache == ShipsStatus.DEFICIT
+    assert any("60003760" in reason for reason in result.reasons)
 
     with _no_esi():
         index_response = viewer_client.get(reverse("marketmonitoring:index"))
         detail_response = viewer_client.get(reverse("marketmonitoring:fit_detail", args=[fit.pk]))
     context = index_response.context
-    assert context["ships_in_contracts_sum"] == 0
+    assert context["ships_in_contracts_sum"] == 7
     assert context["ships_from_market_sum"] == 0
-    assert context["ships_total_sum"] == 0
-    assert context["rows"][0]["ships_total"] is None
-    assert "&mdash;" in index_response.content.decode("utf-8")
-    assert detail_response.context["ships_total"] is None
-    assert detail_response.context["ships_deficit"] is None
-    assert "&mdash;" in detail_response.content.decode("utf-8")
+    assert context["ships_total_sum"] == 7
+    assert context["rows"][0]["ships_total"] == 7
+    detail = detail_response.context
+    assert detail["ships_total"] == 7
+    assert detail["ships_deficit"] == 23
+    assert detail["data_warnings"] is True  # предупреждение о локации без данных, не NO_DATA
+    assert "Calculation scope is empty" not in detail_response.content.decode("utf-8")  # баннер NO_DATA не показан
+
+
+def test_dashboard_sums_keep_fit_with_stale_npc_station(viewer_client, sde_ids):  # noqa: F811
+    """Свежий фит даёт ΣC/ΣK/Σ(C+K); протухшая локация даёт нулевой вклад K (§19.18).
+
+    Дашборд продолжает суммировать оба фита: нулевой вклад не превращает
+    расчёт в partial, а итог Σ(C+K) не меняется (решение №45).
+    """
+    fresh_fit = _seed_reference_market(sde_ids, name="Fresh for sums")
+    _seed_full_kit_contracts(fresh_fit, 7)
+    fresh_result = calc_service.recalc_fit(fresh_fit)
+    assert fresh_result.status == FitStatus.DEFICIT
+    assert fresh_result.ships_availability.ships_total == 17
+
+    stale_fit = Fit.objects.create(
+        name="Stale station fit",
+        hull_type_id=1,
+        qty_target=5,
+        scope_kind=ScopeKind.STATION,
+        scope_ref=60003761,
+    )
+    FitComponent.objects.create(fit=stale_fit, type_id=1, qty_per_fit=1)
+    MarketLocation.objects.create(
+        name="Other station",
+        kind=LocationKind.STATION,
+        station_id=60003761,
+        solar_system_id=SYSTEM_ID,
+        region_id=REGION_ID,
+        enabled=True,
+        sync_status=SyncStatus.OK,
+        last_synced_at=timezone.now(),
+    )
+    StockLevel.objects.create(
+        location_id=60003761,
+        solar_system_id=SYSTEM_ID,
+        region_id=REGION_ID,
+        type_id=1,
+        total_sell_volume=10,
+        updated_at=timezone.now() - timedelta(minutes=600),
+    )
+    stale_result = calc_service.recalc_fit(stale_fit)
+    assert stale_result.status == FitStatus.HULL_MISSING, stale_result.reasons
+    assert stale_result.k == 0
+    assert stale_result.ships_availability.is_partial is False
+    assert stale_result.ships_availability.ships_total == 0
+
+    with _no_esi():
+        response = viewer_client.get(reverse("marketmonitoring:index"))
+    assert response.status_code == 200
+    context = response.context
+    assert context["ships_in_contracts_sum"] == 7
+    assert context["ships_from_market_sum"] == 10
+    assert context["ships_total_sum"] == 17
+    rows = {row["fit"].name: row for row in context["rows"]}
+    assert rows["Fresh for sums"]["ships_total"] == 17
+    assert rows["Stale station fit"]["ships_total"] == 0
+
+
+def test_dashboard_keeps_bottlenecks_and_warns_for_partially_unsynced_fit(viewer_client, sde_ids):  # noqa: F811
+    """Частично несинканная локация: узкие места и сводка сохраняются, NO_DATA не показывается (§19.21)."""
+    fit = Fit.objects.create(
+        name="Partially synced fit",
+        hull_type_id=1,
+        qty_target=30,
+        scope_kind=ScopeKind.SYSTEM,
+        scope_ref=SYSTEM_ID,
+    )
+    FitComponent.objects.create(fit=fit, type_id=1, qty_per_fit=1)
+    FitComponent.objects.create(fit=fit, type_id=2, qty_per_fit=3)
+    _seed_full_kit_contracts(fit, 0)  # контракты известны — фит участвует в сводке C+K
+    stale_station_id = 60003761
+    now = timezone.now()
+    for station_id in (STATION_ID, stale_station_id):
+        MarketLocation.objects.create(
+            name=f"Station {station_id}",
+            kind=LocationKind.STATION,
+            station_id=station_id,
+            solar_system_id=SYSTEM_ID,
+            region_id=REGION_ID,
+            enabled=True,
+            sync_status=SyncStatus.OK,
+            last_synced_at=now,
+        )
+    StockLevel.objects.create(
+        location_id=STATION_ID,
+        solar_system_id=SYSTEM_ID,
+        region_id=REGION_ID,
+        type_id=1,
+        total_sell_volume=10,
+        updated_at=now,
+    )
+    StockLevel.objects.create(
+        location_id=STATION_ID,
+        solar_system_id=SYSTEM_ID,
+        region_id=REGION_ID,
+        type_id=2,
+        total_sell_volume=100,
+        updated_at=now,
+    )
+    # Протухшие объёмы второй станции больше, чем свежие: без исключения
+    # вклад был бы 60/100 и узкое место было бы модулем, а не корпусом.
+    StockLevel.objects.create(
+        location_id=stale_station_id,
+        solar_system_id=SYSTEM_ID,
+        region_id=REGION_ID,
+        type_id=1,
+        total_sell_volume=50,
+        updated_at=now - timedelta(days=2),
+    )
+    StockLevel.objects.create(
+        location_id=stale_station_id,
+        solar_system_id=SYSTEM_ID,
+        region_id=REGION_ID,
+        type_id=2,
+        total_sell_volume=0,
+        updated_at=now - timedelta(days=2),
+    )
+
+    result = calc_service.recalc_fit(fit)
+    assert result.status == FitStatus.DEFICIT
+    assert result.k == 10
+    assert any(str(stale_station_id) in reason for reason in result.reasons)
+
+    with _no_esi():
+        response = viewer_client.get(reverse("marketmonitoring:index"))
+    rows = {row["fit"].name: row for row in response.context["rows"]}
+    row = rows["Partially synced fit"]
+    assert row["bottleneck_names"] == ["Ferox Test Hull"]
+    assert row["fit"].status_cache != FitStatus.NO_DATA
+    assert row["ships_from_market"] == 10
+    assert any(str(stale_station_id) in warning for warning in row["data_warnings"])
+    assert response.context["no_data_count"] == 0
+    assert response.context["ships_from_market_sum"] == 10
+
+    parts = response.content.decode().split("<tr")
+    index = next(i for i, part in enumerate(parts) if "Partially synced fit" in part)
+    # Предупреждение рендерится отдельной строкой сразу после строки фита.
+    row_html = parts[index] + (parts[index + 1] if index + 1 < len(parts) else "")
+    assert "alert-warning" in row_html
+    assert str(stale_station_id) in row_html  # предупреждение с id локации в строке дашборда
+    assert "Calculation scope is empty" not in row_html  # NO_DATA-баннер не показан
 
 
 def test_disabled_jita_does_not_show_stale_prices(viewer_client, sde_ids):  # noqa: F811
@@ -752,7 +894,9 @@ def test_chain_recalc_and_notify_respects_trigger(db):
         mock.patch.object(tasks.notify_deficit, "delay") as notify,
     ):
         tasks._chain_recalc_and_notify(TriggerKind.MANUAL, [], lock_token="tok-1")
-        recalc.assert_called_once_with(trigger=TriggerKind.MANUAL, location_ids=[], lock_token="tok-1")
+        recalc.assert_called_once_with(
+            trigger=TriggerKind.MANUAL, location_ids=[], lock_token="tok-1", zero_location_ids=None
+        )
         notify.assert_not_called()
 
         tasks._chain_recalc_and_notify(TriggerKind.BEAT, None)

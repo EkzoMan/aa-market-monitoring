@@ -3,7 +3,8 @@
 ESI полностью замокан на уровне marketmonitoring.esi.client — сеть не используется.
 Проверяются: выбор по приоритету, cooldown 60 мин при 403 и переход к следующему
 провайдеру в том же прогоне, отключение после 3 сбоев с алертом, сброс счётчика
-при успехе, связка no_provider → sync_status → NO_DATA у фита, verify_providers.
+при успехе, связка no_provider → sync_status → нулевой вклад локации (не NO_DATA; решение №45),
+verify_providers.
 """
 
 import sys
@@ -288,8 +289,8 @@ def test_success_resets_fail_count(settings_row):
 
 
 @pytest.mark.django_db
-def test_no_provider_fit_no_data(settings_row, structure_location):
-    """Нет провайдеров → sync_status=no_provider (§11.6), фит получает NO_DATA через calc (§6.7)."""
+def test_no_provider_fit_zero_availability(settings_row, structure_location):
+    """Нет провайдеров → sync_status=no_provider; вклад структуры 0, не NO_DATA (§19.21)."""
     fit = Fit.objects.create(
         name="Test fit",
         hull_type_id=34,
@@ -303,14 +304,14 @@ def test_no_provider_fit_no_data(settings_row, structure_location):
     assert result["ok"] is True
     structure_location.refresh_from_db()
     assert structure_location.sync_status == SyncStatus.NO_PROVIDER
-    # Цепочка пересчёта выполняется eager: фит — NO_DATA (§6.7: структура sync_status != ok).
+    # Цепочка пересчёта выполняется eager: структура без данных даёт A=0.
     fit.refresh_from_db()
-    assert fit.status_cache == FitStatus.NO_DATA
-    assert fit.fits_available is None
-    assert fit.total_cost is None
+    assert fit.status_cache == FitStatus.HULL_MISSING
+    assert fit.fits_available == 0
+    assert fit.total_cost is None  # Jita не включена — цены докупки нет
     run = SyncRun.objects.filter(task_name="marketmonitoring.sync_structure_orders").latest("started_at")
     assert "no_provider" in run.errors
-    # Прямой пересчёт тоже даёт NO_DATA с причиной no_provider.
+    # Прямой пересчёт тоже считает по общему правилу и сохраняет причину.
     reasons = calc_service.recalc_fit(fit).reasons
     assert any("no_provider" in reason for reason in reasons)
 

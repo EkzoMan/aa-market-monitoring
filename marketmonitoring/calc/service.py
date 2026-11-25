@@ -15,7 +15,6 @@ from django.utils import timezone
 
 from ..constants import (
     ContractFitStatus,
-    FitStatus,
     LocationKind,
     ScopeKind,
     ShipsStatus,
@@ -50,12 +49,13 @@ _UNSET = object()
 
 
 class FitCalcResult:
-    """Итог пересчёта фита: статус, K, сумма, счётчик оверпрайса, строки, причины NO_DATA.
+    """Итог пересчёта фита: статус, K, сумма, счётчик оверпрайса, строки, предупреждения.
 
-    ``reasons`` — причины NO_DATA (§6.7). Решение: причины НЕ сохраняются
-    в модель — в §8 соответствующего поля нет, и расширять модели запрещено;
-    UI получает причины на этапе 5 из результата пересчёта (объект
-    FitCalcResult возвращается recalc_fit / recalc_component_request).
+    ``reasons`` — диагностика локаций без свежих данных (§6.7, решение №45):
+    concrete id и причина. Эти причины НЕ меняют статус фита: локация без
+    данных даёт нулевой вклад в доступность, ``NO_DATA`` остаётся только для
+    пустой области. Причины НЕ сохраняются в модель — в §8 поля нет, и
+    расширять модели запрещено; UI получает их из результата пересчёта.
     """
 
     def __init__(
@@ -221,28 +221,27 @@ def resolve_contract_location_ids(scope_kind: str, scope_ref: int) -> set[int]:
 # ---------------------------------------------------------------------------
 
 
-def check_freshness(location_ids: set[int], stale_after_min: int) -> tuple[bool, list[str]]:
-    """NO_DATA-проверка нужных локаций (§6.7).
+def _freshness_details(location_ids: set[int], stale_after_min: int) -> tuple[set[int], list[str]]:
+    """Локации со свежими данными и причины отсутствия данных (§6.7, решение №45).
 
-    Возвращает (fresh, список причин). Причины NO_DATA: структура с
-    sync_status != ok (в т.ч. без доступного провайдера — no_provider);
-    отсутствие агрегата StockLevel по локации; last_synced_at старше
-    data_stale_after_min; региональный синк региона не завершался успешно
-    за тот же период (оценивается по свежим данным нужных NPC-станций
-    региона, а не по факту любой строки StockLevel в регионе).
+    Возвращает ``(fresh_location_ids, reasons)``. Причины содержат конкретные
+    id локаций: структура с ``sync_status != ok`` (в т.ч. ``no_provider``),
+    протухший ``last_synced_at``, отсутствие свежего ``StockLevel``, региональный
+    синк региона не завершался успешно за период. ``fresh_location_ids``
+    используется для нулевого вклада проблемных локаций в ``A_t^l`` (§6.2):
+    ``check_freshness`` остаётся только диагностикой и не блокирует расчёт.
 
     Региональная проверка применяется только к NPC-станциям: структуры
-    синкаются структурным синком, их свежесть определяется last_synced_at /
-    sync_status, региональная проверка к ним не применяется. NPC-станция
-    без записи MarketLocation тоже проверяется: её регион резолвится через
-    eveuniverse (EveStation -> EveSolarSystem -> EveRegion; своих копий SDE
-    нет — §8). Если регион резолвить не из чего (нет станции в справочнике),
-    это легитимный NO_DATA — нехватка справочника SDE.
+    синкаются структурным синком. NPC-станция без записи MarketLocation тоже
+    проверяется: её регион резолвится через eveuniverse (SDE, §8). Пустой
+    ``last_synced_at`` у NPC-станции не считается протухшим, если свеж
+    региональный ``StockLevel``; протухшее значение даёт предупреждение.
     """
     if not location_ids:
-        return True, []
+        return set(), []
     stale_cutoff = timezone.now() - timedelta(minutes=stale_after_min)
     reasons: list[str] = []
+    bad_locations: set[int] = set()
     locations = {}
     qs = MarketLocation.objects.filter(Q(station_id__in=location_ids) | Q(structure_id__in=location_ids))
     for loc in qs:
@@ -270,28 +269,33 @@ def check_freshness(location_ids: set[int], stale_after_min: int) -> tuple[bool,
             else:
                 region_by_station[station_id] = region_id
         for station_id in unresolved:
-            # Справочника не хватает для региональной проверки — NO_DATA (§6.7).
+            bad_locations.add(station_id)
             reasons.append(f"station {station_id}: cannot resolve region from SDE reference")
 
     for location_id in sorted(location_ids):
         location = locations.get(location_id)
         if location is None:
             # NPC-станция без записи MarketLocation — данные приходят
-            # региональным синком; свежесть оценивается региональной
-            # проверкой ниже (пропуска без проверки нет).
+            # региональным синком; свежесть оценивается проверкой ниже.
             continue
         if location.kind == LocationKind.STRUCTURE:
-            # Структура: sync_status != ok или провайдера нет → NO_DATA (§6.7);
+            # Структура: sync_status != ok или провайдера нет → вклад 0 (§6.7);
             # региональная проверка к структурам не применяется.
             if location.sync_status != SyncStatus.OK:
+                bad_locations.add(location_id)
                 reasons.append(f"structure {location_id}: sync_status={location.sync_status}")
                 continue
-        if location.last_synced_at is None or location.last_synced_at < stale_cutoff:
+            if location.last_synced_at is None or location.last_synced_at < stale_cutoff:
+                bad_locations.add(location_id)
+                reasons.append(f"structure {location_id}: stale")
+        elif location.last_synced_at is not None and location.last_synced_at < stale_cutoff:
+            # NPC-станция: протухшая запись даёт предупреждение. Отсутствие
+            # last_synced_at проверяется региональным кэшем ниже.
+            bad_locations.add(location_id)
             reasons.append(f"location {location_id}: stale")
 
     # Региональный синк региона должен завершаться успешно за период (§6.7):
-    # для каждой нужной NPC-станции региона требуется свежая строка StockLevel
-    # (данные NPC-станций поставляет региональный кэш).
+    # для каждой нужной NPC-станции региона требуется свежая строка StockLevel.
     stations_by_region: dict[int, set[int]] = {}
     for station_id, region_id in region_by_station.items():
         stations_by_region.setdefault(region_id, set()).add(station_id)
@@ -303,9 +307,41 @@ def check_freshness(location_ids: set[int], stale_after_min: int) -> tuple[bool,
             )
         )
         missing = station_set - fresh_stations
+        for station_id in missing:
+            bad_locations.add(station_id)
         if missing:
             reasons.append(f"region {region_id}: no successful region sync in period (stations {sorted(missing)})")
-    return (len(reasons) == 0, reasons)
+
+    # Структура без единого свежего агрегата тоже даёт вклад 0 (§6.7, §5.12).
+    # Для NPC-станций этот случай уже покрыт региональной проверкой выше.
+    fresh_stock = set(
+        StockLevel.objects.filter(location_id__in=location_ids, updated_at__gte=stale_cutoff).values_list(
+            "location_id", flat=True
+        )
+    )
+    missing_stock = {
+        location_id
+        for location_id in location_ids
+        if location_id not in fresh_stock and location_id not in bad_locations
+    }
+    if missing_stock:
+        reasons.append(f"locations {sorted(missing_stock)}: no fresh StockLevel aggregate")
+        bad_locations |= missing_stock
+    return location_ids - bad_locations, reasons
+
+
+def check_freshness(location_ids: set[int], stale_after_min: int) -> tuple[bool, list[str]]:
+    """Диагностика свежести нужных локаций (§6.7); не меняет статус фита.
+
+    Возвращает ``(fresh, reasons)``, где ``reasons`` — конкретные id локаций
+    без данных и причины. Результат ``fresh`` используется только в диагностике:
+    согласно решению №45 локация без данных даёт нулевой вклад в доступность,
+    а ``NO_DATA`` назначается только при пустой области.
+    """
+    if not location_ids:
+        return True, []
+    _fresh_ids, reasons = _freshness_details(location_ids, stale_after_min)
+    return not reasons, reasons
 
 
 def check_contracts_freshness(stale_after_min: int) -> tuple[bool, list[str]]:
@@ -436,30 +472,34 @@ def get_availability(
     scope_kind: str,
     scope_ref: int,
     *,
-    present_locations: set[int] | None = None,
+    location_ids: set[int] | None = None,
+    fresh_locations: set[int] | None = None,
 ) -> tuple[int, bool]:
     """Доступность A_t^S (§6.2) по агрегату StockLevel области.
 
     Строгий scope (§5.1): station — только заказы этой станции; system/region —
     NPC-станции + включённые структуры; order_range не используется (§5.8).
-    Возвращает (A, есть_ли_данные_по_ВСЕМ нужным локациям): NO_DATA, если
-    агрегат StockLevel отсутствует хотя бы у одной локации области (§6.7).
-    При ``present_locations`` (пересчёт фита) проверка делается один раз на
-    все компоненты, без N+1 (§22.4); типа нет в локации → доступность 0.
+    Возвращает ``(A, scope_resolved)``: второй флаг означает только то, что
+    область не пуста (§6.7), а не «данные есть по всем локациям». Локация без
+    свежих данных даёт вклад 0 (решение №45): если передан ``fresh_locations``
+    из :func:`_freshness_details`, её ``StockLevel`` не участвует в сумме.
+    Отсутствие лотов нужного типа — это A=0, а не NO_DATA. При ``location_ids``
+    резолв области не повторяется, без N+1 (§22.4).
     """
-    location_ids = resolve_scope_ids(scope_kind, scope_ref)
+    if location_ids is None:
+        location_ids = resolve_scope_ids(scope_kind, scope_ref)
     if not location_ids:
         return 0, False
+    usable_ids = location_ids if fresh_locations is None else (location_ids & fresh_locations)
+    if not usable_ids:
+        return 0, True
     rows = tuple(
-        StockLevel.objects.filter(type_id=type_id, location_id__in=location_ids).values_list(
+        StockLevel.objects.filter(type_id=type_id, location_id__in=usable_ids).values_list(
             "location_id", "total_sell_volume"
         )
     )
-    if present_locations is None:
-        present_locations = locations_with_stock(location_ids)
-    has_data = location_ids <= present_locations
     total = sum(volume for _location_id, volume in rows)
-    return int(total), has_data
+    return int(total), True
 
 
 # ---------------------------------------------------------------------------
@@ -524,34 +564,63 @@ def _calc_type_ids() -> set[int]:
 # ---------------------------------------------------------------------------
 
 
-def _component_inputs(
+def _component_scopes(
     fit: Fit, scope_cache: dict[tuple[str, int], set[int]]
-) -> tuple[list[tuple[ComponentInput, str, int, bool]], bool]:
+) -> list[tuple[object, str, int, set[int]]]:
+    """Эффективные области позиций фита (§6.3, override компонента) с кешем резолва.
+
+    Один резолв на уникальную область, без повторных запросов по компонентам (§22.4).
+    """
+    rows = []
+    for component in fit.components.all().order_by("pk"):
+        scope_kind = component.scope_override_kind or fit.scope_kind
+        scope_ref = component.scope_override_ref if component.scope_override_kind else fit.scope_ref
+        rows.append((component, scope_kind, scope_ref, _resolve_scope_cached(scope_cache, scope_kind, scope_ref)))
+    return rows
+
+
+def _component_inputs(
+    fit: Fit,
+    scope_cache: dict[tuple[str, int], set[int]],
+    *,
+    fresh_locations: set[int] | None = None,
+    component_scopes: list[tuple[object, str, int, set[int]]] | None = None,
+) -> tuple[list[tuple[ComponentInput, str, int, bool]], bool, dict[tuple[str, int], set[int]]]:
     """Примитивы позиций фита с эффективной областью (§6.3, override компонента).
 
-    Возвращает ((ComponentInput, scope_kind, scope_ref, has_data), ...); область
-    компонента — scope_override, иначе область фита (§6.3, решение 11).
-    resolve_scope_ids кешируется в scope_cache (dict область → ids) — один
-    резолв на уникальную область фита; проверка наличия агрегатов (§6.7) —
+    Возвращает ``((ComponentInput, scope_kind, scope_ref, scope_resolved), ...)``,
+    признак «все области непусты» и словарь областей с id локаций без агрегата
+    StockLevel / без зарезолвенных локаций — только для предупреждений (§6.7).
+    Пустая область — единственный случай для NO_DATA (§6.4, решение №45);
+    отсутствие данных по локации даёт нулевой вклад через ``fresh_locations``
+    и в диагностических ``reasons`` фита, но не меняет статус. Область компонента —
+    scope_override, иначе область фита (§6.3, решение 11). Проверка агрегатов —
     один запрос на объединение локаций всех компонентов, без N+1 (§22.4).
     """
     result = []
     packaged_volumes = _packaged_volumes(refresh=False)
-    has_data_flags = []
-    components = list(fit.components.all().order_by("pk"))
+    scope_flags: list[bool] = []
+    missing_by_scope: dict[tuple[str, int], set[int]] = {}
+    scope_rows = component_scopes if component_scopes is not None else _component_scopes(fit, scope_cache)
     needed_locations: set[int] = set()
-    for component in components:
-        scope_kind = component.scope_override_kind or fit.scope_kind
-        scope_ref = component.scope_override_ref if component.scope_override_kind else fit.scope_ref
-        needed_locations |= _resolve_scope_cached(scope_cache, scope_kind, scope_ref)
+    for _component, _scope_kind, _scope_ref, scope_ids in scope_rows:
+        needed_locations |= scope_ids
+        if not scope_ids:
+            # Пустая область — причина NO_DATA (§6.4); отделяем её от отсутствия агрегата.
+            missing_by_scope.setdefault((_scope_kind, _scope_ref), set())
     present_locations = locations_with_stock(needed_locations)
-    for component in components:
-        scope_kind = component.scope_override_kind or fit.scope_kind
-        scope_ref = component.scope_override_ref if component.scope_override_kind else fit.scope_ref
-        availability, has_data = get_availability(
-            component.type_id, scope_kind, scope_ref, present_locations=present_locations
+    for component, scope_kind, scope_ref, scope_ids in scope_rows:
+        missing = scope_ids - present_locations
+        if missing:
+            missing_by_scope.setdefault((scope_kind, scope_ref), set()).update(missing)
+        availability, scope_resolved = get_availability(
+            component.type_id,
+            scope_kind,
+            scope_ref,
+            location_ids=scope_ids,
+            fresh_locations=fresh_locations,
         )
-        has_data_flags.append(has_data)
+        scope_flags.append(scope_resolved)
         result.append(
             (
                 ComponentInput(
@@ -563,10 +632,10 @@ def _component_inputs(
                 ),
                 scope_kind,
                 scope_ref,
-                has_data,
+                scope_resolved,
             )
         )
-    return result, all(has_data_flags)
+    return result, all(scope_flags), missing_by_scope
 
 
 def _resolve_scope_cached(scope_cache: dict[tuple[str, int], set[int]], scope_kind: str, scope_ref: int) -> set[int]:
@@ -615,10 +684,11 @@ def recalc_fit(fit: Fit) -> FitCalcResult:
 
     В первую очередь оценивается достаточность готовых кораблей в открытых
     контрактах (§6.12), затем рыночная собираемость компонентов (§6.1–§6.9).
-    Нужные локации рынка — объединение областей всех компонентов с учётом override;
-    при NO_DATA (§6.7) дефицит и стоимость не рассчитываются (§6.4). Дефицит —
-    независимо по каждому фиту (§5.5). При выключенной Jita цена докупки
-    недоступна (None), но статус, K и D_i сохраняются (решение №43).
+    Свежесть локаций (§6.7) — только диагностика: локация без данных даёт
+    нулевой вклад в доступность (§5.12, решение №45), а ``NO_DATA`` вызывается
+    ``engine.calc_fit_status`` только при пустой эффективной области (§6.4).
+    Дефицит — независимо по каждому фиту (§5.5). При выключенной Jita цена
+    докупки недоступна (None), но статус, K и D_i сохраняются (решение №43).
     """
     settings_obj = PluginSetting.load()
     scope_cache: dict[tuple[str, int], set[int]] = {}
@@ -628,61 +698,29 @@ def recalc_fit(fit: Fit) -> FitCalcResult:
     # Отдельный кеш: контрактная область (§6.12) и рыночная L(S) (§6.1) —
     # разные множества локаций, хотя ключ у них один и тот же.
     market_scope_cache: dict[tuple[str, int], set[int]] = {}
-    component_rows_data, all_components_have_data = _component_inputs(fit, market_scope_cache)
-    component_rows = component_rows_data
-    if not component_rows:
-        # Без состава рыночная собираемость неизвестна — общий статус no_data (§6.13, §20.43).
-        ships = get_ships_availability(
-            fit,
-            contracts_available=contracts_res.ships_available,
-            market_available=None,
-            contracts_status=contracts_res.status,
-            market_status=FitStatus.NO_DATA,
-        )
-        _save_fit_cache(
-            fit,
-            FitStatus.NO_DATA,
-            None,
-            None,
-            None,
-            contracts_status=contracts_res.status,
-            contracts_available=contracts_res.ships_available,
-            ships_status=ships.ships_status,
-        )
-        return FitCalcResult(
-            FitStatus.NO_DATA,
-            None,
-            None,
-            None,
-            [],
-            contracts_status=contracts_res.status,
-            contracts_available=contracts_res.ships_available,
-            contracts_deficit=contracts_res.deficit,
-            contracts_reasons=contracts_reasons,
-            ships_availability=ships,
-        )
-
-    # Нужные локации — объединение областей всех компонентов (в т.ч. override);
-    # резолв области кешируется на время пересчёта фита.
+    component_scopes = _component_scopes(fit, market_scope_cache)
     needed_location_ids: set[int] = set()
-    for _component_input, scope_kind, scope_ref, _has_data in component_rows:
-        needed_location_ids |= _resolve_scope_cached(market_scope_cache, scope_kind, scope_ref)
-    fresh, reasons = check_freshness(needed_location_ids, settings_obj.data_stale_after_min)
+    for _component, _scope_kind, _scope_ref, scope_ids in component_scopes:
+        needed_location_ids |= scope_ids
+    # Один проход по свежести на все локации фита: причины и set пригодных
+    # локаций для нулевого вклада отсутствующих данных (§6.7, решение №45).
+    fresh_locations, reasons = _freshness_details(needed_location_ids, settings_obj.data_stale_after_min)
+    component_rows_data, all_components_have_scope, missing_by_scope = _component_inputs(
+        fit, market_scope_cache, fresh_locations=fresh_locations, component_scopes=component_scopes
+    )
+    component_rows = component_rows_data
 
-    if not all_components_have_data:
-        for component_input, scope_kind, scope_ref, has_data in component_rows:
-            if not has_data:
-                # Агрегат StockLevel отсутствует хотя бы по одной нужной
-                # локации области (§6.7).
-                reasons.append(
-                    f"type {component_input.type_id}: no StockLevel aggregate "
-                    f"in scope {scope_kind}/{scope_ref} for all needed locations"
-                )
-    if not fresh or not all_components_have_data:
-        # NO_DATA: локация не свежа (§6.7) или агрегат StockLevel отсутствует
-        # по нужной локации (§6.7); дефицит и стоимость не считаются (§6.4).
-        status = engine.STATUS_NO_DATA
-        # K неизвестен: общий статус no_data независимо от контрактов (решение №43).
+    # Причины с конкретными id локаций — предупреждения, а не основание для NO_DATA.
+    for (scope_kind, scope_ref), missing in sorted(missing_by_scope.items()):
+        if not missing:
+            reasons.append(f"scope {scope_kind}/{scope_ref}: no locations resolved")
+        else:
+            reasons.append(f"scope {scope_kind}/{scope_ref}: no StockLevel aggregate for locations {sorted(missing)}")
+
+    if not component_rows or not all_components_have_scope:
+        # Пустая область (или нет состава — решение №43): собираемость неизвестна.
+        # engine.calc_fit_status — единственное место выбора NO_DATA (§6.4).
+        status = engine.calc_fit_status(True, 0, 0, fit.qty_target, allow_hull_missing=True)
         ships = get_ships_availability(
             fit,
             contracts_available=contracts_res.ships_available,
@@ -751,7 +789,7 @@ def recalc_fit(fit: Fit) -> FitCalcResult:
         # Выключенная Jita: цена докупки недоступна, но статус/K/D_i не меняются.
         results = [engine.price_unavailable(result) for result in results]
     hull_available_calc = next((c.availability for c in inputs if c.is_hull), 0)
-    # Фит: ветвление с HULL_MISSING (§6.4).
+    # Фит: NO_DATA уже исключён, HULL_MISSING/DEFICIT/OK — в engine (§6.4).
     status = engine.calc_fit_status(False, hull_available_calc, k, fit.qty_target, allow_hull_missing=True)
     total_cost = None if not jita_price_available else sum((r.cost for r in results), Decimal("0"))
     overprice_count = 0 if not jita_price_available else sum(1 for r in results if r.is_overprice)
@@ -773,7 +811,7 @@ def recalc_fit(fit: Fit) -> FitCalcResult:
         ships_status=ships.ships_status,
     )
     logger.debug(
-        "Fit %s recalculated: contracts=%s(%s) market=%s(%s) ships=%s(%s)",
+        "Fit %s recalculated: contracts=%s(%s) market=%s(%s) ships=%s(%s) warnings=%s",
         fit.pk,
         contracts_res.status,
         contracts_res.ships_available,
@@ -781,6 +819,7 @@ def recalc_fit(fit: Fit) -> FitCalcResult:
         k,
         ships.ships_status,
         ships.ships_total,
+        len(reasons),
     )
     return FitCalcResult(
         status,
@@ -802,21 +841,25 @@ def recalc_component_request(request: ComponentRequest) -> FitCalcResult:
 
     Статусы: OK / DEFICIT / NO_DATA (HULL_MISSING к ним не применяется,
     §6.10 — ветвление статуса через engine.calc_fit_status
-    с allow_hull_missing=False). Причины NO_DATA — в FitCalcResult.reasons
-    (в модель не сохраняются — в §8 поля нет, расширять модели запрещено).
+    с allow_hull_missing=False). ``NO_DATA`` — только при пустой области;
+    локации без данных дают нулевой вклад (§6.7, решение №45) и оставляют
+    причины в ``FitCalcResult.reasons`` (в модель не сохраняются — §8).
     """
     settings_obj = PluginSetting.load()
     location_ids = resolve_scope_ids(request.scope_kind, request.scope_ref)
-    fresh, reasons = check_freshness(location_ids, settings_obj.data_stale_after_min)
-    availability, has_data = get_availability(request.type_id, request.scope_kind, request.scope_ref)
-    if not has_data:
-        reasons.append(
-            f"type {request.type_id}: no StockLevel aggregate "
-            f"in scope {request.scope_kind}/{request.scope_ref} for all needed locations"
-        )
-    if not fresh or not has_data:
-        # NO_DATA при протухших данных или отсутствии агрегата (§6.7).
-        return FitCalcResult(FitStatus.NO_DATA, None, None, None, [], reasons)
+    fresh_locations, reasons = _freshness_details(location_ids, settings_obj.data_stale_after_min)
+    availability, scope_resolved = get_availability(
+        request.type_id,
+        request.scope_kind,
+        request.scope_ref,
+        location_ids=location_ids,
+        fresh_locations=fresh_locations,
+    )
+    if not scope_resolved:
+        reasons.append(f"scope {request.scope_kind}/{request.scope_ref}: no locations resolved")
+        # engine.calc_fit_status — единственное место выбора NO_DATA (§6.4).
+        status = engine.calc_fit_status(True, availability, 0, request.qty_target, allow_hull_missing=False)
+        return FitCalcResult(status, None, None, None, [], reasons)
     book, ref = get_jita_book(request.type_id, settings_obj.jita_book_depth)
     packaged_volumes = _packaged_volumes(refresh=False)
     component = ComponentInput(

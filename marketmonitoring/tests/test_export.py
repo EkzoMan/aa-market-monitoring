@@ -17,8 +17,8 @@ from django.utils import timezone
 from ..auth_hooks import GROUP_VIEW
 from ..calc.service import recalc_fit
 from ..constants import LocationKind, SyncStatus
-from ..views.exports import calc_export_rows
 from ..models import Fit, FitComponent, JitaOrderLevel, MarketLocation, StockLevel
+from ..views.exports import calc_export_rows
 from .test_eft_parser import eve_types  # noqa: F401 — фикстура EveType записей
 
 pytestmark = pytest.mark.django_db

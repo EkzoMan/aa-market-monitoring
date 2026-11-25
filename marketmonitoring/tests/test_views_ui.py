@@ -312,16 +312,48 @@ def test_dashboard_denied_without_view_group(db):
     assert response.status_code != 200 or "No fits yet" not in content
 
 
-def test_fit_detail_no_data_banner(viewer_client, fit_with_component):
-    """NO_DATA: баннер alert-secondary с причиной вместо расчётов (07-states.md §2)."""
+def test_fit_detail_no_data_banner_for_empty_scope(viewer_client, eve_types, sde_ids):  # noqa: F811
+    """NO_DATA: баннер alert-secondary только при пустой области расчёта (§6.4, решение №45)."""
+    from eveuniverse.models import EveConstellation, EveSolarSystem
+
+    empty_system = EveSolarSystem.objects.create(
+        id=30000144,
+        name="Empty system",
+        eve_constellation=EveConstellation.objects.get(id=20000001),
+        security_status=0.9,
+    )
+    fit = Fit.objects.create(
+        name="Empty scope fit",
+        hull_type_id=643,
+        qty_target=2,
+        scope_kind="system",
+        scope_ref=empty_system.id,
+        status_cache="no_data",
+    )
+    fit.components.create(type_id=643, qty_per_fit=1)
+
+    response = viewer_client.get(reverse("marketmonitoring:fit_detail", args=[fit.pk]))
+    content = response.content.decode()
+    assert response.context["status"] == "no_data"
+    assert response.context["k"] is None
+    assert "alert-secondary" in content
+    assert "Calculation scope is empty" in content
+    assert "mm-hull-row" in content  # состав остаётся виден с «—» (02-fit-detail.md §NO_DATA)
+
+
+def test_fit_detail_data_warning_is_not_no_data(viewer_client, fit_with_component):
+    """Локация без данных: отдельное предупреждение, статус/дефицит считаются (§19.21)."""
     from ..models import StockLevel
 
-    StockLevel.objects.all().delete()  # данные отсутствуют → пересчёт даёт NO_DATA
-    fit_with_component.status_cache = "no_data"
-    fit_with_component.save()
-    content = viewer_client.get(reverse("marketmonitoring:fit_detail", args=[fit_with_component.pk])).content.decode()
-    assert "alert-secondary" in content
-    assert "mm-hull-row" in content  # состав остаётся виден с «—» (02-fit-detail.md §NO_DATA)
+    StockLevel.objects.all().delete()
+    response = viewer_client.get(reverse("marketmonitoring:fit_detail", args=[fit_with_component.pk]))
+    content = response.content.decode()
+    assert response.context["status"] != "no_data"
+    assert response.context["data_warnings"] is True
+    assert response.context["k"] == 0
+    assert "alert-warning" in content
+    assert "Calculation scope is empty" not in content  # NO_DATA-баннер не показан
+    assert "no StockLevel aggregate" in content  # причина с id локации остаётся видимой
 
 
 def test_fit_detail_edit_buttons_hidden_for_view(viewer_client, fit_with_component):

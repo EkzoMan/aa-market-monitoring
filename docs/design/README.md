@@ -34,14 +34,14 @@
 
 ## Визуальный язык (Bootstrap 5 / тема AA)
 
-### 1. Палитра статусов — семантика неизменна
+### 1. Палитра статусов (§6.4, решение №45)
 
 | Статус | Класс Bootstrap | Цвет | Применение |
 |---|---|---|---|
 | `OK` | `.bg-success` / badge `text-bg-success` | зелёный | K ≥ N |
 | `DEFICIT` | `.bg-warning` (тёмный текст!) / `text-bg-warning` | оранжевый | 0 ≤ K < N |
 | `HULL_MISSING` | `.bg-danger` / `text-bg-danger` | красный | корпуса нет в области |
-| `NO_DATA` | `.bg-secondary` / `text-bg-secondary` | серый | нет свежих данных |
+| `NO_DATA` | `.bg-secondary` / `text-bg-secondary` | серый | только пустая область `L(S)=∅`; локация без данных даёт вклад 0 и предупреждение |
 
 - Используем **только** семантические токены Bootstrap (`--bs-success`, `--bs-warning`,
   `--bs-danger`, `--bs-secondary`) — никаких собственных hex-констант, тогда палитра
@@ -91,12 +91,18 @@
 - При отказе Clipboard API — fallback `document.execCommand('copy')` с textarea;
   при полном отказе — инлайн-подсказка «Copy failed — use .txt export».
 
-### 6. Баннер NO_DATA
+### 6. Баннер NO_DATA и предупреждение по локации
 
-- `alert alert-secondary` (не danger!) + иконка `fa-solid fa-circle-info`.
-- Текст: «Location {X} is not synced (status: {status}). Deficit and cost are unavailable.»
-- Размещение: над таблицей компонентов в карточке фита; в дашборде — отдельная строка
-  сводки «N fits have no data» со ссылкой на фильтр.
+- Баннер `NO_DATA` — только при пустой области `L(S)=∅`: `alert alert-secondary`
+  (не danger!) + иконка `fa-solid fa-circle-info`. Текст: «Scope resolves to no
+  locations. Deficit, cost and C+K are unavailable». Размещение: над таблицей
+  компонентов в карточке фита; в дашборде — отдельная строка сводки
+  «N fits have no data» со ссылкой на фильтр.
+- Локация без свежих данных (`failed`/`partial`/`no_provider`/`stale`/нет `StockLevel`)
+  даёт вклад 0 и показывается жёлтым `alert alert-warning` с иконкой
+  `fa-solid fa-triangle-exclamation` и **id локации**: «Location {X} has no fresh
+  data (status: {status}). Its contribution is 0; deficit and cost are calculated
+  from the other locations». Статус фита не меняется (решение №45).
 
 ### 7. Иконки
 

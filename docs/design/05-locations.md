@@ -24,8 +24,10 @@
 ## Детали
 
 - **Статус синка** — чип/иконка + текст: `Synced` (success), `Syncing` (warning +
-  spinner), `Failed` (danger), `Never synced` (secondary). Это отражает то, что
-  видно в NO_DATA-баннере карточки фита («Location X … status: Failed»).
+  spinner), `Failed` (danger), `Never synced` (secondary). Это отражается в
+  предупреждении по локации в карточке фита и на дашборде
+  («Location X … status: Failed»); `NO_DATA`-баннер показывается только при
+  пустой области `L(S)=∅` (решение №45).
 - **Вкл/выкл** — форма-toggle (`form-switch`, POST на toggle с CSRF), подтверждение
   не нужно (не destructive: данные сохраняются, меняется только агрегация).
 - **Delete** — иконка → `location_delete.html` (confirm-экран, danger).

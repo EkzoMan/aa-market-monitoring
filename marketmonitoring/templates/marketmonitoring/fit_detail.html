@@ -155,17 +155,26 @@
     </div>
   </div>
 
-  {# NO_DATA-баннер (07-states.md §2): alert-secondary с причиной, вместо расчётов. #}
+  {# NO_DATA-баннер (§6.4, решение №45): только пустая область, не отсутствие данных по локации. #}
   {% if status == 'no_data' %}
   <div class="alert alert-secondary mb-0">
     <i class="fas fa-circle-info me-1" aria-hidden="true"></i>
-    {% translate "Location is not synced. Deficit and cost are unavailable." %}
+    {% translate "Calculation scope is empty. Deficit and cost are unavailable." %}
     {% if can_edit %}<a href="{% url 'marketmonitoring:locations' %}">{% translate "Check Locations" %}</a>{% endif %}
     {% if reasons %}
     <ul class="mb-0 mt-2">
       {% for reason in reasons %}<li><code>{{ reason }}</code></li>{% endfor %}
     </ul>
     {% endif %}
+  </div>
+  {% elif data_warnings and reasons %}
+  {# Локация без данных даёт нулевой вклад, но не меняет статус фита (§6.7, решение №45). #}
+  <div class="alert alert-warning py-2">
+    <i class="fas fa-triangle-exclamation me-1" aria-hidden="true"></i>
+    {% translate "Some market locations have no fresh data; their availability is counted as zero." %}
+    <ul class="mb-0 mt-2">
+      {% for reason in reasons %}<li><code>{{ reason }}</code></li>{% endfor %}
+    </ul>
   </div>
   {% endif %}
 
@@ -195,7 +204,7 @@
           </td>
           <td>{{ row.scope_label }}</td>
           <td class="mm-num">{{ row.required }}</td>
-          <td class="mm-num">{% if row.no_data %}&mdash;{% else %}{{ row.available }}{% endif %}</td>
+          <td class="mm-num">{% if row.no_data or row.available is None %}&mdash;{% else %}{{ row.available }}{% endif %}</td>
           <td class="mm-num">{% if row.no_data %}&mdash;{% else %}{{ row.deficit }}{% endif %}</td>
           <td class="mm-num">{% if row.unit is not None %}{{ row.unit|isk }}{% else %}&mdash;{% endif %}</td>
           <td class="mm-num">{% if row.ref is not None %}{{ row.ref|isk }}{% else %}&mdash;{% endif %}</td>

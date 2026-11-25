@@ -12,7 +12,7 @@ from typing import Any
 from celery import shared_task
 from django.core.cache import cache
 from django.db import transaction
-from django.db.models import Count
+from django.db.models import Count, Q
 from django.utils import timezone
 
 from .constants import (
@@ -227,6 +227,25 @@ def _mark_region_stations(region_id: int, status: str) -> int:
     return qs.update(sync_status=status)
 
 
+def _npc_station_ids_by_region(region_ids: set[int]) -> dict[int, set[int]]:
+    """NPC-станции регионов из SDE eveuniverse (§6.1), без ESI и без N+1.
+
+    Один запрос на все регионы: даже у станции без заказов должен быть нулевой
+    агрегат после успешного полного регионального синка (решение №46).
+    """
+    if not region_ids:
+        return {}
+    result: dict[int, set[int]] = {region_id: set() for region_id in region_ids}
+    from eveuniverse.models import EveStation
+
+    rows = EveStation.objects.filter(eve_solar_system__eve_constellation__eve_region_id__in=region_ids).values_list(
+        "eve_solar_system__eve_constellation__eve_region_id", "pk"
+    )
+    for region_id, station_id in rows:
+        result.setdefault(region_id, set()).add(station_id)
+    return result
+
+
 def _replace_jita_levels(type_ids: list[int], orders: list) -> int:
     """Полная замена JitaOrderLevel по затронутым type_id: топ-jita_book_depth лотов (§9.3).
 
@@ -264,12 +283,47 @@ def _replace_jita_levels(type_ids: list[int], orders: list) -> int:
         return len(levels)
 
 
-def _recalc_stock_levels_for_locations(location_ids: list[int]) -> int:
-    """Пересчёт StockLevel полной заменой по затронутым локациям (§12.5).
+def _location_metadata(location_ids: set[int]) -> dict[int, tuple[int, int]]:
+    """Координаты (system, region) локаций из MarketLocation и SDE eveuniverse.
+
+    Для структур координаты хранятся в ``MarketLocation`` (ESI их не возвращает,
+    §9.3); для NPC-станций без записи ``MarketLocation`` они резолвятся через
+    ``EveStation``. Возвращает только найденные локации — без обращений к ESI.
+    """
+    if not location_ids:
+        return {}
+    result: dict[int, tuple[int, int]] = {}
+    for location in MarketLocation.objects.filter(
+        Q(station_id__in=location_ids) | Q(structure_id__in=location_ids)
+    ).values_list("kind", "station_id", "structure_id", "solar_system_id", "region_id"):
+        kind, station_id, structure_id, system_id, region_id = location
+        if system_id is None or region_id is None:
+            continue
+        location_id = station_id if kind == LocationKind.STATION else structure_id
+        if location_id in location_ids:
+            result[location_id] = (system_id, region_id)
+    missing_stations = location_ids - result.keys()
+    if missing_stations:
+        from eveuniverse.models import EveStation
+
+        for station_id, system_id, region_id in EveStation.objects.filter(pk__in=missing_stations).values_list(
+            "pk", "eve_solar_system_id", "eve_solar_system__eve_constellation__eve_region_id"
+        ):
+            if system_id is not None and region_id is not None:
+                result[station_id] = (system_id, region_id)
+    return result
+
+
+def _recalc_stock_levels_for_locations(location_ids: list[int], zero_location_ids: set[int] | None = None) -> int:
+    """Пересчёт StockLevel полной заменой по затронутым локациям (§12.5, решение №46).
 
     Агрегация MarketOrderCache → total_sell_volume / best_sell по (location_id, type_id).
     ``solar_system_id``/``region_id`` берутся из строк кэша: для структур они
-    записаны из MarketLocation, а не из ответа ESI (§9.3).
+    записаны из MarketLocation, а не из ответа ESI (§9.3). Для локаций из
+    ``zero_location_ids`` (успешный полный синк, включая локации без заказов)
+    создаются нулевые агрегаты по всем типам расчёта, по которым нет строк
+    кэша: ``total_sell_volume=0``, ``best_sell=None``, свежий ``updated_at``.
+    Всё удаление/вставка — в одной транзакции, без дублей по UNIQUE-ключу.
     """
     from django.db.models import Min, Sum
 
@@ -295,6 +349,32 @@ def _recalc_stock_levels_for_locations(location_ids: list[int]) -> int:
             )
             for row in agg
         ]
+        existing_keys = {(level.location_id, level.type_id) for level in levels}
+        zero_ids = (zero_location_ids or set()) & set(location_ids)
+        if zero_ids:
+            meta = _location_metadata(zero_ids)
+            type_ids = sorted(get_calc_type_ids())
+            for location_id in sorted(zero_ids):
+                coordinates = meta.get(location_id)
+                if coordinates is None:
+                    logger.warning("Cannot write zero StockLevel: no coordinates for location %s", location_id)
+                    continue
+                system_id, region_id = coordinates
+                for type_id in type_ids:
+                    if (location_id, type_id) in existing_keys:
+                        continue
+                    levels.append(
+                        StockLevel(
+                            location_id=location_id,
+                            solar_system_id=system_id,
+                            region_id=region_id,
+                            type_id=type_id,
+                            total_sell_volume=0,
+                            best_sell=None,
+                            updated_at=now,
+                        )
+                    )
+                    existing_keys.add((location_id, type_id))
         if levels:
             StockLevel.objects.bulk_create(levels, batch_size=2000)
         return len(levels)
@@ -316,14 +396,29 @@ def _release_sync_lock(trigger: str, lock_token: str | None) -> None:
         logger.info("Manual sync lock released by chain token")
 
 
-def _chain_recalc_and_notify(trigger: str, location_ids: list[int] | None, lock_token: str | None = None) -> None:
+def _chain_recalc_and_notify(
+    trigger: str,
+    location_ids: list[int] | None,
+    lock_token: str | None = None,
+    zero_location_ids: list[int] | None = None,
+) -> None:
     """Цепочка §12.3: sync_* → recalc_stock_levels → notify_deficit (только при trigger=beat).
 
-    location_ids=None означает «все локации, встречающиеся в свежем кэше».
+    ``location_ids`` — затронутые синком локации (включая успешные пустые и
+    partial). ``zero_location_ids`` — SUCCESSFUL полный синк, по которому можно
+    писать нулевые ``StockLevel`` (решение №46); partial в него не попадает.
+    ``location_ids=None`` означает «все локации, встречающиеся в кэше».
+    ``zero_location_ids=None`` трактуется как пустой набор: без явного списка
+    успешных локаций нулевые агрегаты не пишутся (защита от partial).
     lock_token (только при trigger=manual) передаётся финальной задаче цепочки
     для снятия блокировки ручного запуска (§12.4).
     """
-    recalc_stock_levels.delay(trigger=trigger, location_ids=location_ids, lock_token=lock_token)
+    recalc_stock_levels.delay(
+        trigger=trigger,
+        location_ids=location_ids,
+        lock_token=lock_token,
+        zero_location_ids=zero_location_ids,
+    )
     if trigger == TriggerKind.BEAT:
         settings_obj = PluginSetting.load()
         if settings_obj.notification_deficit_enabled or settings_obj.notification_contracts_deficit_enabled:
@@ -412,7 +507,15 @@ def sync_jita_book(self, trigger: str = TriggerKind.BEAT, lock_token: str | None
             status=SyncRunStatus.PARTIAL if partial else SyncRunStatus.OK,
             items_processed=inserted + levels,
         )
-        _chain_recalc_and_notify(trigger, [settings_obj.jita_station_id], lock_token=lock_token)
+        # Jita — успешный полный синк даёт нулевой агрегат даже без заказов;
+        # partial в zero_location_ids не попадает (решение №46). Явная передача
+        # списка важна: None в recalc_stock_levels означал бы «все локации».
+        _chain_recalc_and_notify(
+            trigger,
+            [settings_obj.jita_station_id],
+            lock_token=lock_token,
+            zero_location_ids=[] if partial else [settings_obj.jita_station_id],
+        )
         return {"ok": True, "items": inserted, "levels": levels, "partial": partial}
     except Exception as exc:  # noqa: BLE001 — фиксирование любого сбоя в SyncRun
         logger.exception("sync_jita_book failed")
@@ -456,6 +559,9 @@ def sync_region_orders(
     ok = failed = items = 0
     errors: list[str] = []
     partial_any = False
+    affected_location_ids: set[int] = set()
+    zero_location_ids: set[int] = set()
+    station_ids_by_region = _npc_station_ids_by_region(set(region_ids))
     try:
         for rid in region_ids:
             try:
@@ -465,6 +571,13 @@ def sync_region_orders(
                     orders, source_kind=SourceKind.REGION, source_ref=rid, region_id=rid
                 )
                 items += _replace_source_cache(SourceKind.REGION, rid, rows)
+                # Явно передаём в пересчёт все станции региона, включая те, у
+                # которых заказов нет (решение №46). Partial не даёт нулевых
+                # агрегатов, но затронутые локации пересчитываются по кэшу.
+                region_location_ids = station_ids_by_region.get(rid, set()) | {row["location_id"] for row in rows}
+                affected_location_ids |= region_location_ids
+                if not partial:
+                    zero_location_ids |= region_location_ids
                 # NPC-станции и локации-системы региона получают данные из
                 # регионального кэша: успех — sync_status=ok и свежий
                 # last_synced_at (иначе чип навсегда остаётся stale, §8).
@@ -487,7 +600,12 @@ def sync_region_orders(
             items_processed=items,
             errors="\n".join(errors),
         )
-        _chain_recalc_and_notify(trigger, None, lock_token=lock_token)
+        _chain_recalc_and_notify(
+            trigger,
+            sorted(affected_location_ids),
+            lock_token=lock_token,
+            zero_location_ids=sorted(zero_location_ids),
+        )
         return {"ok": True, "regions_ok": ok, "regions_failed": failed}
     except Exception as exc:  # noqa: BLE001
         logger.exception("sync_region_orders failed")
@@ -524,6 +642,8 @@ def sync_structure_orders(self, trigger: str = TriggerKind.BEAT, lock_token: str
     ok = failed = items = 0
     errors: list[str] = []
     partial_any = False
+    affected_location_ids: set[int] = set()
+    zero_location_ids: set[int] = set()
     try:
         for location in locations:
             structure_id = location.structure_id
@@ -576,6 +696,11 @@ def sync_structure_orders(self, trigger: str = TriggerKind.BEAT, lock_token: str
                     region_id=location.region_id,
                 )
                 items += _replace_source_cache(SourceKind.STRUCTURE, structure_id, rows)
+                # Успешная структура (даже без заказов) попадает в пересчёт и
+                # в список нулевых агрегатов; partial — только в пересчёт (№46).
+                affected_location_ids.add(structure_id)
+                if not partial:
+                    zero_location_ids.add(structure_id)
                 _update_structure_name(location, provider)
                 location.sync_status = SyncStatus.OK if not partial else SyncStatus.ERROR
                 location.last_synced_at = timezone.now()
@@ -602,7 +727,12 @@ def sync_structure_orders(self, trigger: str = TriggerKind.BEAT, lock_token: str
             items_processed=items,
             errors="\n".join(errors),
         )
-        _chain_recalc_and_notify(trigger, None, lock_token=lock_token)
+        _chain_recalc_and_notify(
+            trigger,
+            sorted(affected_location_ids),
+            lock_token=lock_token,
+            zero_location_ids=sorted(zero_location_ids),
+        )
         return {"ok": True, "locations_ok": ok, "locations_failed": failed}
     except Exception as exc:  # noqa: BLE001
         logger.exception("sync_structure_orders failed")
@@ -1000,14 +1130,20 @@ def _structure_field(row: Any, name: str, default: Any = None) -> Any:
 
 @shared_task(bind=True, name="marketmonitoring.recalc_stock_levels")
 def recalc_stock_levels(
-    self, trigger: str = TriggerKind.BEAT, location_ids: list[int] | None = None, lock_token: str | None = None
+    self,
+    trigger: str = TriggerKind.BEAT,
+    location_ids: list[int] | None = None,
+    lock_token: str | None = None,
+    zero_location_ids: list[int] | tuple[int, ...] | None = (),
 ) -> dict:
     """Агрегация MarketOrderCache → StockLevel (§12.1); пересчёт полной заменой по затронутым локациям.
 
-    Без аргумента (None) — все локации, встречающиеся в кэше; пересчитываются агрегаты
-    только по локациям, у которых есть строки MarketOrderCache. В конце — пересчёт фитов/компонентов (§6, calc-ядро).
-    lock_token: финальная задача цепочки ручного запуска снимает mm:sync_lock,
-    если её значение совпадает с токеном (§12.4); при beat блокировка не трогается.
+    ``location_ids=None`` — все локации, встречающиеся в кэше. ``zero_location_ids`` —
+    успешно полностью синканные локации (включая пустые), по которым пишутся
+    нулевые агрегаты; partial сюда не попадает (решение №46). Значение по умолчанию
+    пустое: при прямом вызове без явного списка нули не пишутся. В конце — пересчёт фитов/компонентов
+    (§6, calc-ядро). lock_token: финальная задача цепочки ручного запуска снимает
+    mm:sync_lock, если её значение совпадает с токеном (§12.4); при beat блокировка не трогается.
 
     Ручное обновление ставит несколько sync-задач параллельно, и каждая из них
     запускает сюда пересчёт. Блокировка строки singleton-настроек сериализует
@@ -1024,7 +1160,10 @@ def recalc_stock_levels(
             PluginSetting.objects.select_for_update().get(pk=1)
             if location_ids is None:
                 location_ids = list(MarketOrderCache.objects.values_list("location_id", flat=True).distinct())
-            count = _recalc_stock_levels_for_locations(list(location_ids))
+            # None из старых вызовов цепочки трактуем как «нет подтверждённых
+            # полных синок»: partial не должен неявно получить нулевые агрегаты.
+            zero_ids = set(zero_location_ids or ())
+            count = _recalc_stock_levels_for_locations(list(location_ids), zero_ids)
             calc_stats = calc_service.recalc_all()
         _finish_run(run, status=SyncRunStatus.OK, items_processed=count)
         _release_sync_lock(trigger, lock_token)
