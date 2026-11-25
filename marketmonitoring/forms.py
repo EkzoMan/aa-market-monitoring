@@ -339,9 +339,19 @@ class ContractProviderAddForm(forms.Form):
         widget=forms.Select(attrs={"class": "form-control"}),
     )
 
-    def __init__(self, *args, **kwargs):
-        """Список персонажей — из справочника AA (eveonline), токены не хранятся (§8)."""
+    def __init__(self, *args, user=None, **kwargs):
+        """Список персонажей — только закреплённые за текущим пользователем AA (§8).
+
+        Токены плагин не хранит: владение берётся из ``character_ownership``
+        Alliance Auth. Без пользователя список пуст — форму нельзя использовать
+        для привязки чужого персонажа.
+        """
         from allianceauth.eveonline.models import EveCharacter
 
         super().__init__(*args, **kwargs)
-        self.fields["character"].queryset = EveCharacter.objects.all().order_by("character_name")
+        queryset = EveCharacter.objects.all()
+        if user is not None and getattr(user, "is_authenticated", False):
+            queryset = queryset.filter(character_ownership__user=user)
+        else:
+            queryset = queryset.none()
+        self.fields["character"].queryset = queryset.order_by("character_name")

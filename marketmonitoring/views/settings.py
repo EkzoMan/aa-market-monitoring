@@ -30,6 +30,11 @@ def _character_has_contract_scope(character_id: int, source_kind: str) -> tuple[
     return exists, scope
 
 
+def _user_owns_character(user, character) -> bool:
+    """Персонаж должен быть закреплён за текущим пользователем AA (§8)."""
+    return type(character).objects.filter(pk=character.pk, character_ownership__user=user).exists()
+
+
 def _settings_context(request, webhook_form, contract_provider_form=None):
     """Общий контекст страницы настроек (§14): webhook + провайдеры контрактов.
 
@@ -39,7 +44,7 @@ def _settings_context(request, webhook_form, contract_provider_form=None):
         "page_title": _("Settings"),
         "webhook_form": webhook_form,
         "webhook": WebhookConfig.objects.first(),
-        "contract_provider_form": contract_provider_form or ContractProviderAddForm(),
+        "contract_provider_form": contract_provider_form or ContractProviderAddForm(user=request.user),
         "contract_providers": ContractProvider.objects.select_related("character").order_by("priority", "pk"),
         "provider_status_disabled": ProviderStatus.DISABLED,
     }
@@ -74,9 +79,12 @@ def contract_provider_add(request):
         messages.warning(request, _("Permission denied."))
         return redirect("marketmonitoring:index")
 
-    form = ContractProviderAddForm(request.POST or None)
+    form = ContractProviderAddForm(request.POST or None, user=request.user)
     if request.method == "POST" and form.is_valid():
         character = form.cleaned_data["character"]
+        if not _user_owns_character(request.user, character):
+            messages.error(request, _("You can only add your own characters."))
+            return redirect("marketmonitoring:settings")
         source_kind = form.cleaned_data["source_kind"]
         has_scope, scope = _character_has_contract_scope(character.character_id, source_kind)
         if not has_scope:
