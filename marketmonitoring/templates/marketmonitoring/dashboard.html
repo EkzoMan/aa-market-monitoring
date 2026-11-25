@@ -173,8 +173,8 @@
           </th>
           <th>{% translate "Fit" %}</th>
           {# Collectability = C+K (§6.13, решение №40): единая колонка итога; дубль «Ships total (C+K)» удалён. #}
-          <th>{% translate "Collectability (C+K)" %}</th>
           <th>{% translate "Ships status" %}</th>
+          <th>{% translate "Collectability (C+K)" %}</th>
           <th>{% translate "Ships on market" %}</th>
           <th>{% translate "Contracts status" %}</th>
           <th>{% translate "Ships on contracts" %}</th>
@@ -202,6 +202,7 @@
             </div>
             {% endif %}
           </td>
+          <td><span class="badge text-bg-{{ row.ships_status|status_class }}">{{ row.ships_status|upper }}</span></td>
           {# Collectability = C+K: число и прогресс из сводки кораблей, а не из рыночного K. При no_data — «—» без прогресса (решение №43). #}
           <td>
             {% if row.ships_total is not None %}
@@ -214,7 +215,6 @@
             &mdash;
             {% endif %}
           </td>
-          <td><span class="badge text-bg-{{ row.ships_status|status_class }}">{{ row.ships_status|upper }}</span></td>
           <td><span class="badge text-bg-{{ row.fit.status_cache|status_class }}">{{ row.fit.get_status_cache_display }}</span></td>
           <td>
             {% if row.fit.contracts_status_cache == 'ok' or row.fit.contracts_status_cache == 'deficit' %}
